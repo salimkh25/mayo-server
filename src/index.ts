@@ -50,11 +50,8 @@ const ADMIN_KEY = process.env.ADMIN_KEY ?? 'admin-dev-key';
 const SCARCITY_THRESHOLD = Number(process.env.SCARCITY_THRESHOLD ?? 5);
 
 function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
-  if (req.header('x-admin-key') !== ADMIN_KEY) {
-    res.status(401).json({ error: 'unauthorized' });
-    return;
-  }
-  next();
+  if (emailFromToken(req) === '__admin__') return next();
+  res.status(401).json({ error: 'unauthorized' });
 }
 
 // ---- helpers -------------------------------------------------------------
@@ -887,6 +884,15 @@ app.get('/api/admin/inventory/movements', requireAdmin, (req, res) => {
 
 app.get('/api/admin/items', requireAdmin, (_req, res) => {
   res.json(db.prepare(`SELECT * FROM items ORDER BY sku`).all());
+});
+
+app.post('/api/admin/login', (req, res) => {
+  const { password } = req.body ?? {};
+  if (password === ADMIN_KEY) {
+    res.json({ token: makeToken('__admin__') });
+  } else {
+    res.status(401).json({ error: 'Invalid admin password' });
+  }
 });
 
 // All outfits (any status) with membership ids, for the edit/rebuild forms.
