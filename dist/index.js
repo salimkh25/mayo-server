@@ -110,6 +110,22 @@ function outfitImages(outfitId) {
     const o = db_js_1.db.prepare(`SELECT hero_image FROM outfits WHERE id = ?`).get(outfitId);
     return o?.hero_image ? [o.hero_image] : [];
 }
+/** Photos to display for an outfit. If the set has none of its own, borrow its component
+ *  items' photos so shoppers still see real imagery instead of a placeholder. */
+function outfitPhotos(outfitId) {
+    const own = outfitImages(outfitId);
+    if (own.length)
+        return own;
+    const parts = db_js_1.db
+        .prepare(`SELECT i.id FROM outfit_items oi JOIN items i ON i.id = oi.item_id WHERE oi.outfit_id = ? ORDER BY i.id`)
+        .all(outfitId);
+    const photos = [];
+    for (const p of parts)
+        for (const im of itemImages(p.id))
+            if (im.url)
+                photos.push(im.url);
+    return photos;
+}
 /** Replace an item's gallery and keep image_url (the card thumbnail) as the first photo. */
 function replaceItemImages(itemId, gallery) {
     db_js_1.db.prepare(`DELETE FROM item_images WHERE item_id = ?`).run(itemId);
@@ -183,8 +199,8 @@ function outfitPublic(o, ctx = null) {
         onLoyaltyBand: o.price_floor_cents > 0 && o.price_floor_cents < o.price_cents,
         yourTier: ctx?.tierName ?? null,
         sizeRun: JSON.parse(o.size_run),
-        heroImage: o.hero_image,
-        images: outfitImages(o.id),
+        heroImage: o.hero_image || outfitPhotos(o.id)[0] || '',
+        images: outfitPhotos(o.id),
         paletteFrom: o.palette_from,
         paletteTo: o.palette_to,
         icon: o.icon,

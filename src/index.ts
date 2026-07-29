@@ -4,6 +4,7 @@ import cors from 'cors';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { v2 as cloudinary } from 'cloudinary';
 
 import { db, moveStock, outfitAvailability, itemAvailability, variantSizeFor } from './db.js';
 import { backfillThemeImages, backfillItemPrices, backfillPriceFloors, seedIfEmpty } from './seed.js';
@@ -81,6 +82,19 @@ function outfitImages(outfitId: number): string[] {
   if (rows.length) return rows.map((r) => r.url);
   const o = db.prepare(`SELECT hero_image FROM outfits WHERE id = ?`).get(outfitId) as any;
   return o?.hero_image ? [o.hero_image] : [];
+}
+
+/** Photos to display for an outfit. If the set has none of its own, borrow its component
+ *  items' photos so shoppers still see real imagery instead of a placeholder. */
+function outfitPhotos(outfitId: number): string[] {
+  const own = outfitImages(outfitId);
+  if (own.length) return own;
+  const parts = db
+    .prepare(`SELECT i.id FROM outfit_items oi JOIN items i ON i.id = oi.item_id WHERE oi.outfit_id = ? ORDER BY i.id`)
+    .all(outfitId) as { id: number }[];
+  const photos: string[] = [];
+  for (const p of parts) for (const im of itemImages(p.id)) if (im.url) photos.push(im.url);
+  return photos;
 }
 
 /** Replace an item's gallery and keep image_url (the card thumbnail) as the first photo. */
@@ -166,8 +180,8 @@ function outfitPublic(o: any, ctx: PriceCtx = null) {
     onLoyaltyBand: o.price_floor_cents > 0 && o.price_floor_cents < o.price_cents,
     yourTier: ctx?.tierName ?? null,
     sizeRun: JSON.parse(o.size_run),
-    heroImage: o.hero_image,
-    images: outfitImages(o.id),
+    heroImage: o.hero_image || outfitPhotos(o.id)[0] || '',
+    images: outfitPhotos(o.id),
     paletteFrom: o.palette_from,
     paletteTo: o.palette_to,
     icon: o.icon,
@@ -1367,7 +1381,7 @@ app.post('/api/admin/back-in-stock/:id/notify', requireAdmin, (req, res) => {
 
 // ---- admin: image upload (photos everywhere) -------------------------------------
 
-app.post('/api/admin/upload', requireAdmin, (req, res) => {
+app.post('/api/admin/upload', requireAdmin, async (req, res) => {
   const { dataUrl } = req.body ?? {};
   const m = typeof dataUrl === 'string' && dataUrl.match(/^data:([^;]+);base64,(.+)$/);
   if (!m) return void res.status(400).json({ error: 'expected a base64 image data URL' });
@@ -1375,9 +1389,28 @@ app.post('/api/admin/upload', requireAdmin, (req, res) => {
   if (!ext) return void res.status(400).json({ error: 'unsupported image type (png/jpg/webp/gif/avif)' });
   const buf = Buffer.from(m[2], 'base64');
   if (buf.length > 15 * 1024 * 1024) return void res.status(413).json({ error: 'image too large (max 15MB)' });
-  const name = `${crypto.randomUUID()}.${ext}`;
-  fs.writeFileSync(path.join(uploadsDir, name), buf);
-  res.json({ url: `/api/uploads/${name}` });
+  
+  if (process.env.CLOUDINARY_URL) {
+    try {
+      const result = await new Promise<any>((resolve, reject) => {
+        cloudinary.uploader.upload_stream(
+          { folder: 'nayo' },
+          (error, result) => {
+            if (error) reject(error);
+            else resolve(result);
+          }
+        ).end(buf);
+      });
+      res.json({ url: result.secure_url });
+    } catch (e: any) {
+      console.error('Cloudinary upload error:', e);
+      res.status(500).json({ error: 'Failed to upload to Cloudinary' });
+    }
+  } else {
+    const name = `${crypto.randomUUID()}.${ext}`;
+    fs.writeFileSync(path.join(uploadsDir, name), buf);
+    res.json({ url: `/api/uploads/${name}` });
+  }
 });
 
 // ---- admin: customer analytics ---------------------------------------------------
