@@ -81,13 +81,77 @@ const MIME_EXT = {
 const ADMIN_KEY = process.env.ADMIN_KEY ?? 'admin-dev-key';
 const SCARCITY_THRESHOLD = Number(process.env.SCARCITY_THRESHOLD ?? 5);
 function requireAdmin(req, res, next) {
-    if (req.header('x-admin-key') !== ADMIN_KEY) {
-        res.status(401).json({ error: 'unauthorized' });
-        return;
-    }
-    next();
+    if (emailFromToken(req) === '__admin__')
+        return next();
+    res.status(401).json({ error: 'unauthorized' });
 }
 // ---- helpers -------------------------------------------------------------
+/** Full gallery for an item: the extra photos if any, else the single legacy image_url. */
+function itemImages(itemId) {
+    const rows = db_js_1.db
+        .prepare(`SELECT url, color FROM item_images WHERE item_id = ? ORDER BY sort, id`)
+        .all(itemId);
+    if (rows.length)
+        return rows;
+    const i = db_js_1.db.prepare(`SELECT image_url FROM items WHERE id = ?`).get(itemId);
+    return i?.image_url ? [{ url: i.image_url, color: '' }] : [];
+}
+/** An item's selectable colors (empty = the item has no colors). */
+function itemColors(itemId) {
+    return db_js_1.db.prepare(`SELECT name, swatch, image_url FROM item_colors WHERE item_id = ? ORDER BY sort, id`).all(itemId).map((c) => ({ name: c.name, swatch: c.swatch, imageUrl: c.image_url }));
+}
+/** Full gallery for an outfit: the extra photos if any, else the single legacy hero_image. */
+function outfitImages(outfitId) {
+    const rows = db_js_1.db
+        .prepare(`SELECT url FROM outfit_images WHERE outfit_id = ? ORDER BY sort, id`)
+        .all(outfitId);
+    if (rows.length)
+        return rows.map((r) => r.url);
+    const o = db_js_1.db.prepare(`SELECT hero_image FROM outfits WHERE id = ?`).get(outfitId);
+    return o?.hero_image ? [o.hero_image] : [];
+}
+/** Replace an item's gallery and keep image_url (the card thumbnail) as the first photo. */
+function replaceItemImages(itemId, gallery) {
+    db_js_1.db.prepare(`DELETE FROM item_images WHERE item_id = ?`).run(itemId);
+    gallery.forEach((g, idx) => {
+        if (!g?.url)
+            return;
+        db_js_1.db.prepare(`INSERT INTO item_images (item_id, url, color, sort) VALUES (?, ?, ?, ?)`).run(itemId, g.url, g.color ?? '', idx);
+    });
+    db_js_1.db.prepare(`UPDATE items SET image_url = ? WHERE id = ?`).run(gallery.find((g) => g?.url)?.url ?? '', itemId);
+}
+/** Replace an outfit's gallery and keep hero_image as the first photo. */
+function replaceOutfitImages(outfitId, gallery) {
+    db_js_1.db.prepare(`DELETE FROM outfit_images WHERE outfit_id = ?`).run(outfitId);
+    gallery.forEach((url, idx) => {
+        if (!url)
+            return;
+        db_js_1.db.prepare(`INSERT INTO outfit_images (outfit_id, url, sort) VALUES (?, ?, ?)`).run(outfitId, url, idx);
+    });
+    db_js_1.db.prepare(`UPDATE outfits SET hero_image = ? WHERE id = ?`).run(gallery.find(Boolean) ?? '', outfitId);
+}
+/** Upsert an item's color list (by name) and make sure a variant row exists for every
+ *  (size × color). Surviving variants keep their stock; colors dropped from the list are
+ *  removed along with their (zero-usage) variant rows. The stock ledger is never touched. */
+function syncItemColors(itemId, colors) {
+    const clean = colors.filter((c) => c && c.name && c.name.trim());
+    const sizes = db_js_1.db.prepare(`SELECT DISTINCT size FROM item_variants WHERE item_id = ?`).all(itemId).map((r) => r.size);
+    const keep = new Set(clean.map((c) => c.name));
+    // drop colors no longer listed (and their variants)
+    for (const existing of db_js_1.db.prepare(`SELECT name FROM item_colors WHERE item_id = ?`).all(itemId)) {
+        if (!keep.has(existing.name)) {
+            db_js_1.db.prepare(`DELETE FROM item_colors WHERE item_id = ? AND name = ?`).run(itemId, existing.name);
+            db_js_1.db.prepare(`DELETE FROM item_variants WHERE item_id = ? AND color = ?`).run(itemId, existing.name);
+        }
+    }
+    // upsert listed colors + ensure a variant exists for each size
+    clean.forEach((c, idx) => {
+        db_js_1.db.prepare(`INSERT INTO item_colors (item_id, name, swatch, image_url, sort) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(item_id, name) DO UPDATE SET swatch = excluded.swatch, image_url = excluded.image_url, sort = excluded.sort`).run(itemId, c.name, c.swatch ?? '', c.imageUrl ?? '', idx);
+        for (const size of sizes)
+            db_js_1.db.prepare(`INSERT OR IGNORE INTO item_variants (item_id, size, color, on_hand) VALUES (?, ?, ?, 0)`).run(itemId, size, c.name);
+    });
+}
 function outfitPublic(o, ctx = null) {
     const availability = (0, db_js_1.outfitAvailability)(o.id);
     const maxAvailable = availability.reduce((m, a) => Math.max(m, a.available), 0);
@@ -120,6 +184,7 @@ function outfitPublic(o, ctx = null) {
         yourTier: ctx?.tierName ?? null,
         sizeRun: JSON.parse(o.size_run),
         heroImage: o.hero_image,
+        images: outfitImages(o.id),
         paletteFrom: o.palette_from,
         paletteTo: o.palette_to,
         icon: o.icon,
@@ -165,9 +230,12 @@ function itemPublic(i, ctx = null) {
         onLoyaltyBand: i.price_floor_cents > 0 && i.price_floor_cents < i.list_price_cents,
         yourTier: ctx?.tierName ?? null,
         imageUrl: i.image_url,
+        images: itemImages(i.id),
+        colors: itemColors(i.id),
         soldStandalone: !!i.is_sold_standalone,
-        availability: availability.map(({ size, available }) => ({
+        availability: availability.map(({ size, color, available }) => ({
             size,
+            color: color ?? '',
             soldOut: available <= 0,
             lowStock: available > 0 && available <= SCARCITY_THRESHOLD,
             left: available > 0 && available <= SCARCITY_THRESHOLD ? available : null,
@@ -461,12 +529,13 @@ function computeOrder(email, outfitLines, itLines, shipMethod) {
         const it = db_js_1.db.prepare(`SELECT * FROM items WHERE id = ? AND is_sold_standalone = 1`).get(line.itemId);
         if (!it)
             throw new Error(`Item ${line.itemId} unavailable`);
-        const avail = (0, db_js_1.itemAvailability)(it.id).find((a) => a.size === line.size);
+        const color = line.color ?? '';
+        const avail = (0, db_js_1.itemAvailability)(it.id).find((a) => a.size === line.size && (a.color ?? '') === color);
         if (!avail || avail.available < line.qty)
-            throw new Error(`"${it.name}" (${line.size}) has only ${avail?.available ?? 0} left`);
+            throw new Error(`"${it.name}" (${[color, line.size].filter(Boolean).join(' · ')}) has only ${avail?.available ?? 0} left`);
         const listUnit = it.list_price_cents;
         const unit = effectiveUnitPrice(listUnit, it.price_floor_cents, it.sale_price_cents, ctx);
-        return { item: it, size: line.size, qty: line.qty, listUnit, unit };
+        return { item: it, size: line.size, color, qty: line.qty, listUnit, unit };
     });
     const listSubtotal = [...outLines, ...iLines].reduce((n, l) => n + l.listUnit * l.qty, 0);
     const loyaltySubtotal = [...outLines, ...iLines].reduce((n, l) => n + l.unit * l.qty, 0);
@@ -500,8 +569,8 @@ app.post('/api/quote', (req, res) => {
             shippingCents: q.shippingCents,
             totalCents: q.totalCents,
             lines: [
-                ...q.outLines.map((l) => ({ kind: 'outfit', name: l.outfit.name, size: l.size, qty: l.qty, listUnitCents: l.listUnit, unitCents: l.unit })),
-                ...q.iLines.map((l) => ({ kind: 'item', name: l.item.name, size: l.size, qty: l.qty, listUnitCents: l.listUnit, unitCents: l.unit })),
+                ...q.outLines.map((l) => ({ kind: 'outfit', name: l.outfit.name, size: l.size, color: '', qty: l.qty, listUnitCents: l.listUnit, unitCents: l.unit })),
+                ...q.iLines.map((l) => ({ kind: 'item', name: l.item.name, size: l.size, color: l.color ?? '', qty: l.qty, listUnitCents: l.listUnit, unitCents: l.unit })),
             ],
         });
     }
@@ -524,16 +593,16 @@ function commitOrder(email, customerName, outfitLines, itLines, ship, stripeSess
         for (const l of q.outLines) {
             db_js_1.db.prepare(`INSERT INTO order_lines (order_id, outfit_id, size, qty, unit_price_cents) VALUES (?, ?, ?, ?, ?)`).run(orderId, l.outfit.id, l.size, l.qty, l.unit);
             const parts = db_js_1.db
-                .prepare(`SELECT i.id, i.sizing FROM outfit_items oi JOIN items i ON i.id = oi.item_id WHERE oi.outfit_id = ?`)
+                .prepare(`SELECT i.id, i.sizing, oi.color FROM outfit_items oi JOIN items i ON i.id = oi.item_id WHERE oi.outfit_id = ?`)
                 .all(l.outfit.id);
             for (const p of parts) {
                 const vsize = p.sizing === 'one-size' ? 'ONE' : l.size;
-                (0, db_js_1.moveStock)(p.id, vsize, -l.qty, 'sale', `Order #${orderId} — ${l.outfit.name}`, 'storefront', orderId);
+                (0, db_js_1.moveStock)(p.id, vsize, p.color ?? '', -l.qty, 'sale', `Order #${orderId} — ${l.outfit.name}`, 'storefront', orderId);
             }
         }
         for (const l of q.iLines) {
-            db_js_1.db.prepare(`INSERT INTO order_item_lines (order_id, item_id, size, qty, unit_price_cents) VALUES (?, ?, ?, ?, ?)`).run(orderId, l.item.id, l.size, l.qty, l.unit);
-            (0, db_js_1.moveStock)(l.item.id, (0, db_js_1.variantSizeFor)(l.item.id, l.size), -l.qty, 'sale', `Order #${orderId} — ${l.item.name}`, 'storefront', orderId);
+            db_js_1.db.prepare(`INSERT INTO order_item_lines (order_id, item_id, size, color, qty, unit_price_cents) VALUES (?, ?, ?, ?, ?, ?)`).run(orderId, l.item.id, l.size, l.color ?? '', l.qty, l.unit);
+            (0, db_js_1.moveStock)(l.item.id, (0, db_js_1.variantSizeFor)(l.item.id, l.size), l.color ?? '', -l.qty, 'sale', `Order #${orderId} — ${l.item.name}`, 'storefront', orderId);
         }
         db_js_1.db.exec('COMMIT');
         return {
@@ -748,7 +817,7 @@ app.get('/api/admin/inventory', requireAdmin, (_req, res) => {
     const items = db_js_1.db.prepare(`SELECT * FROM items ORDER BY sku`).all();
     const result = items.map((i) => {
         const variants = db_js_1.db
-            .prepare(`SELECT size, on_hand, reserved FROM item_variants WHERE item_id = ? ORDER BY size`)
+            .prepare(`SELECT size, color, on_hand, reserved FROM item_variants WHERE item_id = ? ORDER BY color, size`)
             .all(i.id);
         const gates = db_js_1.db
             .prepare(`SELECT o.id, o.slug, o.name FROM outfit_items oi JOIN outfits o ON o.id = oi.outfit_id
@@ -758,7 +827,7 @@ app.get('/api/admin/inventory', requireAdmin, (_req, res) => {
             id: i.id, sku: i.sku, name: i.name, type: i.type, sizing: i.sizing,
             costCents: i.cost_cents, reorderPoint: i.reorder_point,
             variants: variants.map((v) => ({
-                size: v.size, onHand: v.on_hand, reserved: v.reserved,
+                size: v.size, color: v.color ?? '', onHand: v.on_hand, reserved: v.reserved,
                 available: v.on_hand - v.reserved,
                 low: v.on_hand - v.reserved <= i.reorder_point,
             })),
@@ -775,16 +844,16 @@ app.get('/api/admin/inventory', requireAdmin, (_req, res) => {
     res.json({ items: result, outfitConstraints: constraints });
 });
 app.post('/api/admin/inventory/adjust', requireAdmin, (req, res) => {
-    const { itemId, size, delta, kind, reason } = req.body ?? {};
+    const { itemId, size, color, delta, kind, reason } = req.body ?? {};
     const validKinds = ['receiving', 'adjustment', 'return', 'write-off'];
     if (!itemId || !size || !Number.isInteger(delta) || delta === 0 || !validKinds.includes(kind))
         return void res.status(400).json({ error: 'itemId, size, non-zero integer delta and valid kind required' });
-    const v = db_js_1.db.prepare(`SELECT on_hand, reserved FROM item_variants WHERE item_id = ? AND size = ?`).get(itemId, size);
+    const v = db_js_1.db.prepare(`SELECT on_hand, reserved FROM item_variants WHERE item_id = ? AND size = ? AND color = ?`).get(itemId, size, color ?? '');
     if (!v)
         return void res.status(404).json({ error: 'variant not found' });
     if (v.on_hand + delta < 0)
         return void res.status(409).json({ error: 'would drive stock negative' });
-    (0, db_js_1.moveStock)(itemId, size, delta, kind, reason ?? '', 'admin');
+    (0, db_js_1.moveStock)(itemId, size, color ?? '', delta, kind, reason ?? '', 'admin');
     res.json({ ok: true, onHand: v.on_hand + delta });
 });
 app.get('/api/admin/inventory/movements', requireAdmin, (req, res) => {
@@ -798,7 +867,24 @@ app.get('/api/admin/inventory/movements', requireAdmin, (req, res) => {
 });
 // ---- admin: catalog management -----------------------------------------------------
 app.get('/api/admin/items', requireAdmin, (_req, res) => {
-    res.json(db_js_1.db.prepare(`SELECT * FROM items ORDER BY sku`).all());
+    const items = db_js_1.db.prepare(`SELECT * FROM items ORDER BY sku`).all();
+    res.json(items.map((i) => ({
+        ...i,
+        gallery: itemImages(i.id),
+        colors: itemColors(i.id),
+        variants: db_js_1.db
+            .prepare(`SELECT size, color, on_hand FROM item_variants WHERE item_id = ? ORDER BY color, size`)
+            .all(i.id),
+    })));
+});
+app.post('/api/admin/login', (req, res) => {
+    const { password } = req.body ?? {};
+    if (password === ADMIN_KEY) {
+        res.json({ token: makeToken('__admin__') });
+    }
+    else {
+        res.status(401).json({ error: 'Invalid admin password' });
+    }
 });
 // All outfits (any status) with membership ids, for the edit/rebuild forms.
 app.get('/api/admin/outfits', requireAdmin, (_req, res) => {
@@ -857,6 +943,8 @@ app.delete('/api/admin/items/:id', requireAdmin, (req, res) => {
     try {
         db_js_1.db.prepare(`DELETE FROM item_variants WHERE item_id = ?`).run(id);
         db_js_1.db.prepare(`DELETE FROM stock_movements WHERE item_id = ?`).run(id);
+        db_js_1.db.prepare(`DELETE FROM item_colors WHERE item_id = ?`).run(id);
+        db_js_1.db.prepare(`DELETE FROM item_images WHERE item_id = ?`).run(id);
         db_js_1.db.prepare(`DELETE FROM items WHERE id = ?`).run(id);
         db_js_1.db.exec('COMMIT');
         res.json({ ok: true });
@@ -879,6 +967,8 @@ app.post('/api/admin/outfits', requireAdmin, (req, res) => {
             db_js_1.db.prepare(`INSERT INTO outfit_items (outfit_id, item_id) VALUES (?, ?)`).run(oid, iid);
         for (const tid of themeIds ?? [])
             db_js_1.db.prepare(`INSERT INTO outfit_themes (outfit_id, theme_id) VALUES (?, ?)`).run(oid, tid);
+        if (Array.isArray(req.body?.gallery))
+            replaceOutfitImages(oid, req.body.gallery);
         db_js_1.db.exec('COMMIT');
         res.json({ ok: true, id: oid });
     }
@@ -919,16 +1009,16 @@ app.patch('/api/admin/orders/:id', requireAdmin, (req, res) => {
             const oLines = db_js_1.db.prepare(`SELECT * FROM order_lines WHERE order_id = ?`).all(id);
             for (const l of oLines) {
                 const parts = db_js_1.db
-                    .prepare(`SELECT i.id, i.sizing FROM outfit_items oi JOIN items i ON i.id = oi.item_id WHERE oi.outfit_id = ?`)
+                    .prepare(`SELECT i.id, i.sizing, oi.color FROM outfit_items oi JOIN items i ON i.id = oi.item_id WHERE oi.outfit_id = ?`)
                     .all(l.outfit_id);
                 for (const p of parts) {
                     const vsize = p.sizing === 'one-size' ? 'ONE' : l.size;
-                    (0, db_js_1.moveStock)(p.id, vsize, l.qty, 'return', `Order #${id} cancelled`, 'admin', id);
+                    (0, db_js_1.moveStock)(p.id, vsize, p.color ?? '', l.qty, 'return', `Order #${id} cancelled`, 'admin', id);
                 }
             }
             const iLines = db_js_1.db.prepare(`SELECT * FROM order_item_lines WHERE order_id = ?`).all(id);
             for (const l of iLines) {
-                (0, db_js_1.moveStock)(l.item_id, (0, db_js_1.variantSizeFor)(l.item_id, l.size), l.qty, 'return', `Order #${id} cancelled`, 'admin', id);
+                (0, db_js_1.moveStock)(l.item_id, (0, db_js_1.variantSizeFor)(l.item_id, l.size), l.color ?? '', l.qty, 'return', `Order #${id} cancelled`, 'admin', id);
             }
         }
         db_js_1.db.prepare(`UPDATE orders SET status = ? WHERE id = ?`).run(status, id);
@@ -942,20 +1032,29 @@ app.patch('/api/admin/orders/:id', requireAdmin, (req, res) => {
 });
 // ---- admin: product management (create / edit items, variants, outfits, themes) ----
 app.post('/api/admin/items', requireAdmin, (req, res) => {
-    const { sku, name, type, sizing, costCents, listPriceCents, priceFloorCents, salePriceCents, detail, icon, reorderPoint, isSoldStandalone, imageUrl, variants } = req.body ?? {};
+    const { sku, name, type, sizing, costCents, listPriceCents, priceFloorCents, salePriceCents, detail, icon, reorderPoint, isSoldStandalone, imageUrl, gallery, colors, variants } = req.body ?? {};
     if (!sku || !name || !['garment', 'accessory', 'perfume'].includes(type) || !['sized', 'one-size'].includes(sizing))
         return void res.status(400).json({ error: 'sku, name, valid type and sizing required' });
+    const colorList = Array.isArray(colors) ? colors.filter((c) => c?.name?.trim()) : [];
     db_js_1.db.exec('BEGIN');
     try {
         db_js_1.db.prepare(`INSERT INTO items (sku, name, type, sizing, cost_cents, list_price_cents, price_floor_cents, sale_price_cents, detail, icon, reorder_point, is_sold_standalone, image_url)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(sku, name, type, sizing, costCents ?? 0, listPriceCents ?? 0, priceFloorCents ?? 0, salePriceCents ?? 0, detail ?? '', icon ?? 'apparel', reorderPoint ?? 5, isSoldStandalone === false ? 0 : 1, imageUrl ?? '');
         const itemId = Number(db_js_1.db.prepare(`SELECT last_insert_rowid() AS id`).get().id);
-        const vs = sizing === 'one-size' ? [{ size: 'ONE', onHand: variants?.[0]?.onHand ?? 0 }] : (variants ?? []);
+        // register colors (metadata only; variants below carry the stock)
+        colorList.forEach((c, idx) => db_js_1.db.prepare(`INSERT OR IGNORE INTO item_colors (item_id, name, swatch, image_url, sort) VALUES (?, ?, ?, ?, ?)`).run(itemId, c.name, c.swatch ?? '', c.imageUrl ?? '', idx));
+        // variants: [{size, color?, onHand}]. one-size collapses size to 'ONE'; color '' = no colors.
+        const vs = sizing === 'one-size'
+            ? (Array.isArray(variants) && variants.length ? variants.map((v) => ({ ...v, size: 'ONE' })) : [{ size: 'ONE', onHand: variants?.[0]?.onHand ?? 0 }])
+            : (variants ?? []);
         for (const v of vs) {
-            db_js_1.db.prepare(`INSERT OR IGNORE INTO item_variants (item_id, size, on_hand) VALUES (?, ?, 0)`).run(itemId, v.size);
-            if (v.onHand > 0)
-                (0, db_js_1.moveStock)(itemId, v.size, v.onHand, 'initial', 'Opening stock', 'admin');
+            const color = v.color ?? '';
+            db_js_1.db.prepare(`INSERT OR IGNORE INTO item_variants (item_id, size, color, on_hand) VALUES (?, ?, ?, 0)`).run(itemId, v.size, color);
+            if ((v.onHand ?? 0) > 0)
+                (0, db_js_1.moveStock)(itemId, v.size, color, v.onHand, 'initial', 'Opening stock', 'admin');
         }
+        if (Array.isArray(gallery))
+            replaceItemImages(itemId, gallery);
         db_js_1.db.exec('COMMIT');
         res.json({ ok: true, id: itemId });
     }
@@ -977,22 +1076,33 @@ app.patch('/api/admin/items/:id', requireAdmin, (req, res) => {
         ['image_url', b.imageUrl],
         ['is_sold_standalone', b.isSoldStandalone === undefined ? undefined : b.isSoldStandalone ? 1 : 0],
     ].filter(([, v]) => v !== undefined);
-    if (fields.length === 0)
-        return void res.status(400).json({ error: 'no fields to update' });
-    db_js_1.db.prepare(`UPDATE items SET ${fields.map(([k]) => `${k} = ?`).join(', ')} WHERE id = ?`).run(...fields.map(([, v]) => v), id);
+    db_js_1.db.exec('BEGIN');
+    try {
+        if (fields.length > 0)
+            db_js_1.db.prepare(`UPDATE items SET ${fields.map(([k]) => `${k} = ?`).join(', ')} WHERE id = ?`).run(...fields.map(([, v]) => v), id);
+        if (Array.isArray(b.colors))
+            syncItemColors(id, b.colors);
+        if (Array.isArray(b.gallery))
+            replaceItemImages(id, b.gallery);
+        db_js_1.db.exec('COMMIT');
+    }
+    catch (e) {
+        db_js_1.db.exec('ROLLBACK');
+        return void res.status(409).json({ error: e.message });
+    }
     res.json({ ok: true });
 });
 app.post('/api/admin/items/:id/variants', requireAdmin, (req, res) => {
     const id = Number(req.params.id);
-    const { size, onHand } = req.body ?? {};
+    const { size, color, onHand } = req.body ?? {};
     if (!size)
         return void res.status(400).json({ error: 'size required' });
     const item = db_js_1.db.prepare(`SELECT id FROM items WHERE id = ?`).get(id);
     if (!item)
         return void res.status(404).json({ error: 'item not found' });
-    db_js_1.db.prepare(`INSERT OR IGNORE INTO item_variants (item_id, size, on_hand) VALUES (?, ?, 0)`).run(id, size);
+    db_js_1.db.prepare(`INSERT OR IGNORE INTO item_variants (item_id, size, color, on_hand) VALUES (?, ?, ?, 0)`).run(id, size, color ?? '');
     if (onHand > 0)
-        (0, db_js_1.moveStock)(id, size, onHand, 'initial', 'Variant opening stock', 'admin');
+        (0, db_js_1.moveStock)(id, size, color ?? '', onHand, 'initial', 'Variant opening stock', 'admin');
     res.json({ ok: true });
 });
 app.patch('/api/admin/outfits/:id', requireAdmin, (req, res) => {
@@ -1024,6 +1134,8 @@ app.patch('/api/admin/outfits/:id', requireAdmin, (req, res) => {
             for (const tid of b.themeIds)
                 db_js_1.db.prepare(`INSERT INTO outfit_themes (outfit_id, theme_id) VALUES (?, ?)`).run(id, tid);
         }
+        if (Array.isArray(b.gallery))
+            replaceOutfitImages(id, b.gallery);
         db_js_1.db.exec('COMMIT');
         res.json({ ok: true });
     }
@@ -1041,6 +1153,7 @@ app.delete('/api/admin/outfits/:id', requireAdmin, (req, res) => {
     try {
         db_js_1.db.prepare(`DELETE FROM outfit_items WHERE outfit_id = ?`).run(id);
         db_js_1.db.prepare(`DELETE FROM outfit_themes WHERE outfit_id = ?`).run(id);
+        db_js_1.db.prepare(`DELETE FROM outfit_images WHERE outfit_id = ?`).run(id);
         db_js_1.db.prepare(`DELETE FROM outfits WHERE id = ?`).run(id);
         db_js_1.db.exec('COMMIT');
         res.json({ ok: true });
@@ -1071,19 +1184,19 @@ app.get('/api/admin/reorder', requireAdmin, (req, res) => {
     const coverDays = Number(req.query.coverDays ?? 30); // target days of stock to reorder up to
     const windowDays = 30; // sales velocity window
     const sales = db_js_1.db
-        .prepare(`SELECT item_id, size, SUM(-delta) AS sold FROM stock_movements
+        .prepare(`SELECT item_id, size, color, SUM(-delta) AS sold FROM stock_movements
        WHERE kind = 'sale' AND created_at >= datetime('now', ?)
-       GROUP BY item_id, size`)
+       GROUP BY item_id, size, color`)
         .all(`-${windowDays} days`);
     const soldMap = new Map();
     for (const s of sales)
-        soldMap.set(`${s.item_id}:${s.size}`, s.sold);
+        soldMap.set(`${s.item_id}:${s.size}:${s.color ?? ''}`, s.sold);
     const variants = db_js_1.db
-        .prepare(`SELECT v.item_id, v.size, v.on_hand, v.reserved, i.name, i.sku, i.reorder_point
-       FROM item_variants v JOIN items i ON i.id = v.item_id ORDER BY i.name, v.size`)
+        .prepare(`SELECT v.item_id, v.size, v.color, v.on_hand, v.reserved, i.name, i.sku, i.reorder_point
+       FROM item_variants v JOIN items i ON i.id = v.item_id ORDER BY i.name, v.color, v.size`)
         .all();
     const rows = variants.map((v) => {
-        const sold = soldMap.get(`${v.item_id}:${v.size}`) ?? 0;
+        const sold = soldMap.get(`${v.item_id}:${v.size}:${v.color ?? ''}`) ?? 0;
         const dailyRate = sold / windowDays;
         const available = v.on_hand - v.reserved;
         const daysOfStock = dailyRate > 0 ? Math.round(available / dailyRate) : null; // null = no recent sales
@@ -1094,7 +1207,7 @@ app.get('/api/admin/reorder', requireAdmin, (req, res) => {
         const target = Math.max(Math.ceil(dailyRate * coverDays), flagged ? v.reorder_point + 1 : 0);
         const suggestedQty = Math.max(0, target - available);
         return {
-            itemId: v.item_id, sku: v.sku, name: v.name, size: v.size,
+            itemId: v.item_id, sku: v.sku, name: v.name, size: v.size, color: v.color ?? '',
             available, reorderPoint: v.reorder_point, sold30: sold,
             dailyRate: Number(dailyRate.toFixed(2)), daysOfStock,
             flag: belowReorder ? 'below-reorder' : runningOut ? 'running-out' : 'ok',
@@ -1105,13 +1218,13 @@ app.get('/api/admin/reorder', requireAdmin, (req, res) => {
     res.json({ coverDays, windowDays, needsAttention, all: rows });
 });
 app.post('/api/admin/reorder/receive', requireAdmin, (req, res) => {
-    const { itemId, size, qty, reason } = req.body ?? {};
+    const { itemId, size, color, qty, reason } = req.body ?? {};
     if (!itemId || !size || !Number.isInteger(qty) || qty <= 0)
         return void res.status(400).json({ error: 'itemId, size and positive qty required' });
-    const v = db_js_1.db.prepare(`SELECT id FROM item_variants WHERE item_id = ? AND size = ?`).get(itemId, size);
+    const v = db_js_1.db.prepare(`SELECT id FROM item_variants WHERE item_id = ? AND size = ? AND color = ?`).get(itemId, size, color ?? '');
     if (!v)
         return void res.status(404).json({ error: 'variant not found' });
-    (0, db_js_1.moveStock)(itemId, size, qty, 'receiving', reason ?? 'Reorder received', 'admin');
+    (0, db_js_1.moveStock)(itemId, size, color ?? '', qty, 'receiving', reason ?? 'Reorder received', 'admin');
     res.json({ ok: true });
 });
 // ---- admin: back-in-stock waitlist -----------------------------------------------

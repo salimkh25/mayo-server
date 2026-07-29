@@ -53,9 +53,10 @@ exports.db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     item_id INTEGER NOT NULL REFERENCES items(id),
     size TEXT NOT NULL,                          -- 'ONE' for one-size items
+    color TEXT NOT NULL DEFAULT '',              -- '' = the item has no colors (single variant)
     on_hand INTEGER NOT NULL DEFAULT 0,
     reserved INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(item_id, size)
+    UNIQUE(item_id, size, color)
   );
 
   CREATE TABLE IF NOT EXISTS outfits (
@@ -169,6 +170,34 @@ exports.db.exec(`
     order_id INTEGER,                              -- set once fulfilled (idempotency)
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  -- A product's selectable colors. An item with no rows here has a single implicit
+  -- variant (color = '') and behaves exactly like the original size-only model.
+  CREATE TABLE IF NOT EXISTS item_colors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL REFERENCES items(id),
+    name TEXT NOT NULL,                            -- display + the variant/image color key
+    swatch TEXT NOT NULL DEFAULT '',               -- hex for the swatch dot (optional)
+    image_url TEXT NOT NULL DEFAULT '',            -- photo shown when this color is picked
+    sort INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(item_id, name)
+  );
+
+  -- Extra gallery photos. color = '' → shown for every color; otherwise tied to that color.
+  CREATE TABLE IF NOT EXISTS item_images (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL REFERENCES items(id),
+    url TEXT NOT NULL,
+    color TEXT NOT NULL DEFAULT '',
+    sort INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS outfit_images (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    outfit_id INTEGER NOT NULL REFERENCES outfits(id),
+    url TEXT NOT NULL,
+    sort INTEGER NOT NULL DEFAULT 0
+  );
 `);
 // Additive migrations for existing databases
 const MIGRATIONS = [
@@ -190,6 +219,11 @@ const MIGRATIONS = [
     `ALTER TABLE outfits ADD COLUMN sale_price_cents INTEGER NOT NULL DEFAULT 0`,
     // Stripe Checkout session that paid for an order (blank for dev/manual orders).
     `ALTER TABLE orders ADD COLUMN stripe_session_id TEXT NOT NULL DEFAULT ''`,
+    // Color variants: the stock ledger, standalone order lines and outfit components all
+    // gain a color key. '' preserves the original single-variant behaviour everywhere.
+    `ALTER TABLE stock_movements ADD COLUMN color TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE order_item_lines ADD COLUMN color TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE outfit_items ADD COLUMN color TEXT NOT NULL DEFAULT ''`,
 ];
 for (const sql of MIGRATIONS) {
     try {
@@ -199,6 +233,30 @@ for (const sql of MIGRATIONS) {
         /* column already exists */
     }
 }
+// item_variants gained a `color` dimension with UNIQUE(item_id, size, color). SQLite can't
+// ALTER an existing UNIQUE constraint, so rebuild the table once for databases created before
+// this change (detected by the absence of the color column). Nothing has an FK to item_variants,
+// so the rename/copy/drop is safe. Fresh databases already get the new schema above and skip this.
+const hasColor = exports.db.prepare(`PRAGMA table_info(item_variants)`).all().some((c) => c.name === 'color');
+if (!hasColor) {
+    exports.db.exec(`
+    BEGIN;
+    ALTER TABLE item_variants RENAME TO item_variants_old;
+    CREATE TABLE item_variants (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      item_id INTEGER NOT NULL REFERENCES items(id),
+      size TEXT NOT NULL,
+      color TEXT NOT NULL DEFAULT '',
+      on_hand INTEGER NOT NULL DEFAULT 0,
+      reserved INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(item_id, size, color)
+    );
+    INSERT INTO item_variants (id, item_id, size, color, on_hand, reserved)
+      SELECT id, item_id, size, '', on_hand, reserved FROM item_variants_old;
+    DROP TABLE item_variants_old;
+    COMMIT;
+  `);
+}
 /** Effective availability of an outfit per size = min(available) across its items.
  *  One-size items (variant size 'ONE') constrain every size of the outfit. */
 function outfitAvailability(outfitId) {
@@ -206,11 +264,13 @@ function outfitAvailability(outfitId) {
     if (!outfit)
         return [];
     const sizes = JSON.parse(outfit.size_run);
+    // Each component draws from the specific color the outfit is built with (oi.color; '' for
+    // non-colorized items), so a set's availability tracks exactly that variant's stock.
     const rows = exports.db
         .prepare(`SELECT i.id AS item_id, i.name, i.sizing, v.size, (v.on_hand - v.reserved) AS available
        FROM outfit_items oi
        JOIN items i ON i.id = oi.item_id
-       JOIN item_variants v ON v.item_id = i.id
+       JOIN item_variants v ON v.item_id = i.id AND v.color = oi.color
        WHERE oi.outfit_id = ?`)
         .all(outfitId);
     return sizes.map((size) => {
@@ -230,17 +290,17 @@ function outfitAvailability(outfitId) {
         return { size, available: Math.max(0, min), limitedBy };
     });
 }
-function moveStock(itemId, size, delta, kind, reason, actor, orderId) {
-    exports.db.prepare(`INSERT INTO stock_movements (item_id, size, delta, kind, reason, actor, order_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`).run(itemId, size, delta, kind, reason, actor, orderId ?? null);
-    exports.db.prepare(`UPDATE item_variants SET on_hand = on_hand + ? WHERE item_id = ? AND size = ?`).run(delta, itemId, size);
+function moveStock(itemId, size, color, delta, kind, reason, actor, orderId) {
+    exports.db.prepare(`INSERT INTO stock_movements (item_id, size, color, delta, kind, reason, actor, order_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(itemId, size, color, delta, kind, reason, actor, orderId ?? null);
+    exports.db.prepare(`UPDATE item_variants SET on_hand = on_hand + ? WHERE item_id = ? AND size = ? AND color = ?`).run(delta, itemId, size, color);
 }
-/** Per-size standalone availability for an item (available = on_hand − reserved). */
+/** Per-variant standalone availability for an item (available = on_hand − reserved). */
 function itemAvailability(itemId) {
     const rows = exports.db
-        .prepare(`SELECT size, (on_hand - reserved) AS available FROM item_variants WHERE item_id = ? ORDER BY size`)
+        .prepare(`SELECT size, color, (on_hand - reserved) AS available FROM item_variants WHERE item_id = ? ORDER BY color, size`)
         .all(itemId);
-    return rows.map((r) => ({ size: r.size, available: Math.max(0, r.available), limitedBy: null }));
+    return rows.map((r) => ({ size: r.size, color: r.color, available: Math.max(0, r.available), limitedBy: null }));
 }
 /** The variant size to draw from for an item at a given outfit/selected size. */
 function variantSizeFor(itemId, selectedSize) {

@@ -121,16 +121,16 @@ export function seedIfEmpty() {
     'PRF-001': 24,
     'PRF-002': 5,
   };
-  const insVariant = db.prepare(`INSERT INTO item_variants (item_id, size, on_hand) VALUES (?, ?, 0)`);
+  const insVariant = db.prepare(`INSERT INTO item_variants (item_id, size, color, on_hand) VALUES (?, ?, '', 0)`);
   for (const [sku, sizes] of Object.entries(stock)) {
     for (const [size, qty] of Object.entries(sizes)) {
       insVariant.run(items[sku], size);
-      moveStock(items[sku], size, qty, 'initial', 'Opening stock', 'seed');
+      moveStock(items[sku], size, '', qty, 'initial', 'Opening stock', 'seed');
     }
   }
   for (const [sku, qty] of Object.entries(oneSize)) {
     insVariant.run(items[sku], 'ONE');
-    moveStock(items[sku], 'ONE', qty, 'initial', 'Opening stock', 'seed');
+    moveStock(items[sku], 'ONE', '', qty, 'initial', 'Opening stock', 'seed');
   }
 
   const insOutfit = db.prepare(

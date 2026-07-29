@@ -110,16 +110,16 @@ function seedIfEmpty() {
         'PRF-001': 24,
         'PRF-002': 5,
     };
-    const insVariant = db_js_1.db.prepare(`INSERT INTO item_variants (item_id, size, on_hand) VALUES (?, ?, 0)`);
+    const insVariant = db_js_1.db.prepare(`INSERT INTO item_variants (item_id, size, color, on_hand) VALUES (?, ?, '', 0)`);
     for (const [sku, sizes] of Object.entries(stock)) {
         for (const [size, qty] of Object.entries(sizes)) {
             insVariant.run(items[sku], size);
-            (0, db_js_1.moveStock)(items[sku], size, qty, 'initial', 'Opening stock', 'seed');
+            (0, db_js_1.moveStock)(items[sku], size, '', qty, 'initial', 'Opening stock', 'seed');
         }
     }
     for (const [sku, qty] of Object.entries(oneSize)) {
         insVariant.run(items[sku], 'ONE');
-        (0, db_js_1.moveStock)(items[sku], 'ONE', qty, 'initial', 'Opening stock', 'seed');
+        (0, db_js_1.moveStock)(items[sku], 'ONE', '', qty, 'initial', 'Opening stock', 'seed');
     }
     const insOutfit = db_js_1.db.prepare(`INSERT INTO outfits (slug, name, story, price_cents, size_run, hero_image, palette_from, palette_to, icon, rating)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
