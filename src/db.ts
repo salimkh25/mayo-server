@@ -227,6 +227,18 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(email, kind, ref_id)
   );
+
+  -- One message thread per customer (keyed by email). sender = who wrote it.
+  CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    sender TEXT NOT NULL CHECK (sender IN ('customer','shop')),
+    body TEXT NOT NULL,
+    read_by_customer INTEGER NOT NULL DEFAULT 0,
+    read_by_shop INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_messages_email ON messages(email, id);
 `);
 
 // Additive migrations for existing databases

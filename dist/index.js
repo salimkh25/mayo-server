@@ -42,6 +42,7 @@ const cors_1 = __importDefault(require("cors"));
 const node_crypto_1 = __importDefault(require("node:crypto"));
 const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
+const cloudinary_1 = require("cloudinary");
 const db_js_1 = require("./db.js");
 const seed_js_1 = require("./seed.js");
 const notify_js_1 = require("./notify.js");
@@ -72,6 +73,7 @@ app.use((req, res, next) => {
 // Vite server proxies /api, so a relative fallback works; set PUBLIC_URL in production.
 const PUBLIC_URL = (process.env.PUBLIC_URL ?? '').replace(/\/$/, '');
 const publicUrl = (req) => PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
+const CLIENT_URL = (process.env.CLIENT_URL ?? '').replace(/\/$/, '') || 'http://localhost:5173';
 // Served under /api so the Vite dev proxy forwards it; also works in prod behind one host.
 app.use('/api/uploads', express_1.default.static(uploadsDir, { maxAge: '365d', immutable: true }));
 const MIME_EXT = {
@@ -81,9 +83,13 @@ const MIME_EXT = {
 const ADMIN_KEY = process.env.ADMIN_KEY ?? 'admin-dev-key';
 const SCARCITY_THRESHOLD = Number(process.env.SCARCITY_THRESHOLD ?? 5);
 function requireAdmin(req, res, next) {
-    if (emailFromToken(req) === '__admin__')
+    const email = emailFromToken(req);
+    if (!email)
+        return void res.status(401).json({ error: 'unauthorized' });
+    const user = db_js_1.db.prepare(`SELECT role FROM users WHERE email = ?`).get(email);
+    if (user?.role === 'admin')
         return next();
-    res.status(401).json({ error: 'unauthorized' });
+    res.status(403).json({ error: 'forbidden - admins only' });
 }
 // ---- helpers -------------------------------------------------------------
 /** Full gallery for an item: the extra photos if any, else the single legacy image_url. */
@@ -376,18 +382,18 @@ function hashPassword(password, salt) {
     return node_crypto_1.default.scryptSync(password, salt, 64).toString('hex');
 }
 app.post('/api/auth/register', (req, res) => {
-    const { email, name, password } = req.body ?? {};
+    const { email, name, city, address, dob, phone, password } = req.body ?? {};
     const em = String(email ?? '').toLowerCase().trim();
-    if (!em.includes('@') || !password || String(password).length < 8)
-        return void res.status(400).json({ error: 'Valid email and a password of 8+ characters required' });
+    if (!em.includes('@') || !password || String(password).length < 8 || !city || !address || !dob || !phone)
+        return void res.status(400).json({ error: 'All fields are required, and password must be 8+ characters' });
     const salt = node_crypto_1.default.randomBytes(16).toString('hex');
     try {
-        db_js_1.db.prepare(`INSERT INTO users (email, name, password_hash, salt) VALUES (?, ?, ?, ?)`).run(em, String(name ?? ''), hashPassword(String(password), salt), salt);
+        db_js_1.db.prepare(`INSERT INTO users (email, name, city, address, dob, phone, password_hash, salt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(em, String(name ?? ''), String(city ?? ''), String(address ?? ''), String(dob ?? ''), String(phone ?? ''), hashPassword(String(password), salt), salt);
     }
     catch {
         return void res.status(409).json({ error: 'An account with this email already exists' });
     }
-    res.json({ token: makeToken(em), email: em, name: String(name ?? '') });
+    res.json({ token: makeToken(em), email: em, name: String(name ?? ''), role: 'regular' });
 });
 app.post('/api/auth/login', (req, res) => {
     const { email, password } = req.body ?? {};
@@ -400,7 +406,7 @@ app.post('/api/auth/login', (req, res) => {
     const b = Buffer.from(user.password_hash);
     if (a.length !== b.length || !node_crypto_1.default.timingSafeEqual(a, b))
         return void res.status(401).json({ error: 'Invalid email or password' });
-    res.json({ token: makeToken(em), email: em, name: user.name });
+    res.json({ token: makeToken(em), email: em, name: user.name, role: user.role });
 });
 app.get('/api/me', (req, res) => {
     const email = emailFromToken(req);
@@ -410,6 +416,124 @@ app.get('/api/me', (req, res) => {
     if (!user)
         return void res.status(401).json({ error: 'unauthorized' });
     res.json({ ...user, loyalty: tierFor(email) });
+});
+// ---- customer: order history, delivery confirmation, product reviews -------------
+/** A signed-in shopper's own orders, each with its lines, per-line "received" flag,
+ *  a thumbnail, and their own star review of that product (if any). */
+app.get('/api/my/orders', (req, res) => {
+    const email = emailFromToken(req);
+    if (!email)
+        return void res.status(401).json({ error: 'unauthorized' });
+    const orders = db_js_1.db.prepare(`SELECT id, status, subtotal_cents, discount_cents, shipping_cents, total_cents, ship_method, created_at
+     FROM orders WHERE email = ? ORDER BY id DESC`).all(email);
+    const reviewOf = (kind, refId) => db_js_1.db.prepare(`SELECT stars, comment FROM reviews WHERE email = ? AND kind = ? AND ref_id = ?`).get(email, kind, refId) ?? null;
+    res.json(orders.map((o) => {
+        const outfitLines = db_js_1.db.prepare(`SELECT ol.id, ol.outfit_id AS refId, ol.size, ol.qty, ol.unit_price_cents, ol.received, ou.name, ou.slug
+       FROM order_lines ol JOIN outfits ou ON ou.id = ol.outfit_id WHERE ol.order_id = ?`).all(o.id);
+        const itemLines = db_js_1.db.prepare(`SELECT il.id, il.item_id AS refId, il.size, il.color, il.qty, il.unit_price_cents, il.received, i.name, i.sku
+       FROM order_item_lines il JOIN items i ON i.id = il.item_id WHERE il.order_id = ?`).all(o.id);
+        const lines = [
+            ...outfitLines.map((l) => ({
+                kind: 'outfit', lineId: l.id, refId: l.refId, slug: l.slug, name: l.name,
+                size: l.size, color: '', qty: l.qty, unitPriceCents: l.unit_price_cents,
+                received: !!l.received, image: outfitPhotos(l.refId)[0] ?? '', review: reviewOf('outfit', l.refId),
+            })),
+            ...itemLines.map((l) => ({
+                kind: 'item', lineId: l.id, refId: l.refId, slug: l.sku, name: l.name,
+                size: l.size, color: l.color ?? '', qty: l.qty, unitPriceCents: l.unit_price_cents,
+                received: !!l.received, image: itemImages(l.refId)[0]?.url ?? '', review: reviewOf('item', l.refId),
+            })),
+        ];
+        return {
+            id: o.id, status: o.status, createdAt: o.created_at,
+            subtotalCents: o.subtotal_cents, discountCents: o.discount_cents,
+            shippingCents: o.shipping_cents, totalCents: o.total_cents, shipMethod: o.ship_method,
+            lines,
+        };
+    }));
+});
+/** Customer confirms (or un-confirms) that a specific line arrived. */
+app.post('/api/my/orders/received', (req, res) => {
+    const email = emailFromToken(req);
+    if (!email)
+        return void res.status(401).json({ error: 'unauthorized' });
+    const { kind, lineId, received } = req.body ?? {};
+    const table = kind === 'item' ? 'order_item_lines' : kind === 'outfit' ? 'order_lines' : null;
+    if (!table || !Number.isInteger(lineId))
+        return void res.status(400).json({ error: 'valid kind and lineId required' });
+    const owns = db_js_1.db.prepare(`SELECT 1 FROM ${table} l JOIN orders o ON o.id = l.order_id WHERE l.id = ? AND o.email = ?`).get(lineId, email);
+    if (!owns)
+        return void res.status(404).json({ error: 'line not found' });
+    db_js_1.db.prepare(`UPDATE ${table} SET received = ? WHERE id = ?`).run(received ? 1 : 0, lineId);
+    res.json({ ok: true });
+});
+/** Create or update the shopper's star review for a product they purchased. */
+app.post('/api/my/review', (req, res) => {
+    const email = emailFromToken(req);
+    if (!email)
+        return void res.status(401).json({ error: 'unauthorized' });
+    const { kind, refId, stars, comment } = req.body ?? {};
+    if ((kind !== 'outfit' && kind !== 'item') || !Number.isInteger(refId) || !Number.isInteger(stars) || stars < 1 || stars > 5)
+        return void res.status(400).json({ error: 'kind, refId and stars (1–5) required' });
+    const bought = kind === 'outfit'
+        ? db_js_1.db.prepare(`SELECT 1 FROM order_lines l JOIN orders o ON o.id = l.order_id WHERE o.email = ? AND l.outfit_id = ? AND o.status != 'cancelled'`).get(email, refId)
+        : db_js_1.db.prepare(`SELECT 1 FROM order_item_lines l JOIN orders o ON o.id = l.order_id WHERE o.email = ? AND l.item_id = ? AND o.status != 'cancelled'`).get(email, refId);
+    if (!bought)
+        return void res.status(403).json({ error: 'You can only review products you have purchased.' });
+    db_js_1.db.prepare(`INSERT INTO reviews (email, kind, ref_id, stars, comment) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(email, kind, ref_id) DO UPDATE SET stars = excluded.stars, comment = excluded.comment, created_at = datetime('now')`).run(email, kind, refId, stars, String(comment ?? ''));
+    // Keep the outfit's public aggregate rating in sync (items have no aggregate column yet).
+    if (kind === 'outfit') {
+        const avg = db_js_1.db.prepare(`SELECT AVG(stars) AS a FROM reviews WHERE kind = 'outfit' AND ref_id = ?`).get(refId).a ?? 0;
+        db_js_1.db.prepare(`UPDATE outfits SET rating = ? WHERE id = ?`).run(Math.round(avg * 10) / 10, refId);
+    }
+    res.json({ ok: true });
+});
+// ---- customer ⇄ shop messaging --------------------------------------------------
+/** The signed-in shopper's message thread with the shop. Reading it marks the shop's
+ *  replies as seen. */
+app.get('/api/my/messages', (req, res) => {
+    const email = emailFromToken(req);
+    if (!email)
+        return void res.status(401).json({ error: 'unauthorized' });
+    const messages = db_js_1.db.prepare(`SELECT id, sender, body, created_at AS createdAt FROM messages WHERE email = ? ORDER BY id`).all(email);
+    db_js_1.db.prepare(`UPDATE messages SET read_by_customer = 1 WHERE email = ? AND sender = 'shop'`).run(email);
+    res.json(messages);
+});
+app.post('/api/my/messages', (req, res) => {
+    const email = emailFromToken(req);
+    if (!email)
+        return void res.status(401).json({ error: 'unauthorized' });
+    const body = String(req.body?.body ?? '').trim();
+    if (!body)
+        return void res.status(400).json({ error: 'Message can’t be empty.' });
+    db_js_1.db.prepare(`INSERT INTO messages (email, sender, body, read_by_customer) VALUES (?, 'customer', ?, 1)`).run(email, body.slice(0, 4000));
+    (0, notify_js_1.notify)(`💬 New message from ${email}`, { title: 'NAYO — Customer message', url: `${publicUrl(req)}/admin/messages` });
+    res.json({ ok: true });
+});
+/** Admin: one row per customer thread with a preview and unread (from-customer) count. */
+app.get('/api/admin/messages', requireAdmin, (_req, res) => {
+    const threads = db_js_1.db.prepare(`SELECT m.email,
+            (SELECT body FROM messages WHERE email = m.email ORDER BY id DESC LIMIT 1) AS lastBody,
+            (SELECT created_at FROM messages WHERE email = m.email ORDER BY id DESC LIMIT 1) AS lastAt,
+            SUM(CASE WHEN sender = 'customer' AND read_by_shop = 0 THEN 1 ELSE 0 END) AS unread,
+            (SELECT name FROM users WHERE users.email = m.email) AS name
+     FROM messages m GROUP BY m.email ORDER BY lastAt DESC`).all();
+    res.json(threads);
+});
+app.get('/api/admin/messages/:email', requireAdmin, (req, res) => {
+    const email = String(req.params.email).toLowerCase();
+    const messages = db_js_1.db.prepare(`SELECT id, sender, body, created_at AS createdAt FROM messages WHERE email = ? ORDER BY id`).all(email);
+    db_js_1.db.prepare(`UPDATE messages SET read_by_shop = 1 WHERE email = ? AND sender = 'customer'`).run(email);
+    res.json({ email, name: db_js_1.db.prepare(`SELECT name FROM users WHERE email = ?`).get(email)?.name ?? '', messages });
+});
+app.post('/api/admin/messages/:email', requireAdmin, (req, res) => {
+    const email = String(req.params.email).toLowerCase();
+    const body = String(req.body?.body ?? '').trim();
+    if (!body)
+        return void res.status(400).json({ error: 'Message can’t be empty.' });
+    db_js_1.db.prepare(`INSERT INTO messages (email, sender, body, read_by_shop) VALUES (?, 'shop', ?, 1)`).run(email, body.slice(0, 4000));
+    res.json({ ok: true });
 });
 // ---- public: personalized recommendations (consented, first-party data only) ----
 app.get('/api/recommendations', (req, res) => {
@@ -755,7 +879,7 @@ app.get('/api/orders/by-session/:sid', async (req, res) => {
         return void res.status(404).json({ error: 'Payment is still processing — refresh in a moment.' });
     res.json(order);
 });
-// ---- social sign-in (Google / Facebook / Apple) ----------------------------
+// ---- social sign-in (Google / Facebook) ----------------------------
 function upsertOAuthUser(email, name) {
     const em = email.toLowerCase().trim();
     const existing = db_js_1.db.prepare(`SELECT email, name FROM users WHERE email = ?`).get(em);
@@ -774,33 +898,27 @@ app.get('/api/auth/:provider/start', (req, res) => {
     if (!oauth.PROVIDERS.includes(p))
         return void res.status(404).json({ error: 'unknown provider' });
     if (!oauth.providerConfigured(p))
-        return void res.redirect('/login?error=' + encodeURIComponent(`${p} sign-in is not set up yet`));
-    const redirectUri = `${publicUrl(req)}/api/auth/${p}/callback`;
+        return void res.redirect(`${CLIENT_URL}/login?error=` + encodeURIComponent(`${p} sign-in is not set up yet`));
+    const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/${p}/callback`;
     res.redirect(oauth.authUrl(p, oauth.makeState(), redirectUri));
 });
-async function handleOAuthCallback(p, req, res, code, state, appleUser) {
-    if (!oauth.PROVIDERS.includes(p))
-        return void res.status(404).send('unknown provider');
-    if (!oauth.verifyState(state) || !code)
-        return void res.redirect('/login?error=' + encodeURIComponent('Sign-in expired — please try again'));
+async function handleOAuthCallback(p, req, res, code, state) {
     try {
-        const redirectUri = `${publicUrl(req)}/api/auth/${p}/callback`;
-        const profile = await oauth.exchangeCodeForProfile(p, code, redirectUri, appleUser);
+        if (!oauth.verifyState(state))
+            throw new Error('Invalid state (CSRF match failed)');
+        const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/${p}/callback`;
+        const profile = await oauth.exchangeCodeForProfile(p, code, redirectUri);
         const token = upsertOAuthUser(profile.email, profile.name);
         const frag = new URLSearchParams({ token, email: profile.email, name: profile.name || '' }).toString();
-        res.redirect(`/auth/callback#${frag}`);
+        res.redirect(`${CLIENT_URL}/auth/callback#${frag}`);
     }
     catch (e) {
         console.error('oauth callback error', e?.message ?? e);
-        res.redirect('/login?error=' + encodeURIComponent('Sign-in failed — please try again'));
+        res.redirect(`${CLIENT_URL}/login?error=` + encodeURIComponent('Sign-in failed — please try again'));
     }
 }
 app.get('/api/auth/:provider/callback', (req, res) => {
-    void handleOAuthCallback(req.params.provider, req, res, String(req.query.code ?? ''), req.query.state, undefined);
-});
-// Apple uses response_mode=form_post, so its callback arrives as a POST form body.
-app.post('/api/auth/apple/callback', express_1.default.urlencoded({ extended: true }), (req, res) => {
-    void handleOAuthCallback('apple', req, res, String(req.body.code ?? ''), req.body.state, req.body.user);
+    void handleOAuthCallback(req.params.provider, req, res, String(req.query.code ?? ''), String(req.query.state ?? ''));
 });
 // ---- public: consent-gated events -------------------------------------------
 app.post('/api/events', (req, res) => {
@@ -896,7 +1014,11 @@ app.get('/api/admin/items', requireAdmin, (_req, res) => {
 app.post('/api/admin/login', (req, res) => {
     const { password } = req.body ?? {};
     if (password === ADMIN_KEY) {
-        res.json({ token: makeToken('__admin__') });
+        const email = emailFromToken(req);
+        if (!email)
+            return void res.status(401).json({ error: 'You must be logged in as a regular user first to upgrade to admin.' });
+        db_js_1.db.prepare(`UPDATE users SET role = 'admin' WHERE email = ?`).run(email);
+        res.json({ success: true, role: 'admin' });
     }
     else {
         res.status(401).json({ error: 'Invalid admin password' });
@@ -1261,7 +1383,7 @@ app.post('/api/admin/back-in-stock/:id/notify', requireAdmin, (req, res) => {
     res.json({ ok: true });
 });
 // ---- admin: image upload (photos everywhere) -------------------------------------
-app.post('/api/admin/upload', requireAdmin, (req, res) => {
+app.post('/api/admin/upload', requireAdmin, async (req, res) => {
     const { dataUrl } = req.body ?? {};
     const m = typeof dataUrl === 'string' && dataUrl.match(/^data:([^;]+);base64,(.+)$/);
     if (!m)
@@ -1272,35 +1394,66 @@ app.post('/api/admin/upload', requireAdmin, (req, res) => {
     const buf = Buffer.from(m[2], 'base64');
     if (buf.length > 15 * 1024 * 1024)
         return void res.status(413).json({ error: 'image too large (max 15MB)' });
-    const name = `${node_crypto_1.default.randomUUID()}.${ext}`;
-    node_fs_1.default.writeFileSync(node_path_1.default.join(uploadsDir, name), buf);
-    res.json({ url: `/api/uploads/${name}` });
+    if (process.env.CLOUDINARY_URL) {
+        try {
+            const result = await new Promise((resolve, reject) => {
+                cloudinary_1.v2.uploader.upload_stream({ folder: 'nayo' }, (error, result) => {
+                    if (error)
+                        reject(error);
+                    else
+                        resolve(result);
+                }).end(buf);
+            });
+            res.json({ url: result.secure_url });
+        }
+        catch (e) {
+            console.error('Cloudinary upload error:', e);
+            res.status(500).json({ error: 'Failed to upload to Cloudinary' });
+        }
+    }
+    else {
+        const name = `${node_crypto_1.default.randomUUID()}.${ext}`;
+        node_fs_1.default.writeFileSync(node_path_1.default.join(uploadsDir, name), buf);
+        res.json({ url: `/api/uploads/${name}` });
+    }
 });
 // ---- admin: customer analytics ---------------------------------------------------
 app.get('/api/admin/customers', requireAdmin, (_req, res) => {
     const rows = db_js_1.db
-        .prepare(`SELECT email,
-              MAX(customer_name) AS name,
-              COUNT(*) AS orders,
-              SUM(total_cents) AS spend_cents,
-              MIN(created_at) AS first_order,
-              MAX(created_at) AS last_order
-       FROM orders WHERE status != 'cancelled'
-       GROUP BY email
+        .prepare(`SELECT COALESCE(u.email, o.email) AS email,
+              u.id AS user_id,
+              COALESCE(u.name, MAX(o.customer_name)) AS name,
+              u.role,
+              u.city,
+              u.phone,
+              COUNT(o.id) AS orders,
+              COALESCE(SUM(o.total_cents), 0) AS spend_cents,
+              MIN(o.created_at) AS first_order,
+              MAX(o.created_at) AS last_order
+       FROM (SELECT DISTINCT email FROM (
+         SELECT email FROM users UNION SELECT email FROM orders WHERE status != 'cancelled'
+       )) e
+       LEFT JOIN users u ON u.email = e.email
+       LEFT JOIN orders o ON o.email = e.email AND o.status != 'cancelled'
+       GROUP BY e.email
        ORDER BY spend_cents DESC`)
         .all();
     const customers = rows.map((r) => {
         const tier = tierFor(r.email);
         return {
             email: r.email,
+            userId: r.user_id,
             name: r.name || r.email.split('@')[0],
+            role: r.role || 'guest',
+            city: r.city || '',
+            phone: r.phone || '',
             orders: r.orders,
             spendCents: r.spend_cents,
             aovCents: r.orders ? Math.round(r.spend_cents / r.orders) : 0,
             firstOrder: r.first_order,
             lastOrder: r.last_order,
             tier: tier.tier.name,
-            hasAccount: !!db_js_1.db.prepare(`SELECT 1 FROM users WHERE email = ?`).get(r.email),
+            hasAccount: !!r.user_id,
         };
     });
     const totalCustomers = customers.length;
@@ -1331,6 +1484,23 @@ app.get('/api/admin/customers', requireAdmin, (_req, res) => {
         customers,
     });
 });
+app.patch('/api/admin/customers/:id/role', requireAdmin, (req, res) => {
+    const { id } = req.params;
+    const { role } = req.body ?? {};
+    if (!['admin', 'regular'].includes(role))
+        return void res.status(400).json({ error: 'invalid role' });
+    db_js_1.db.prepare(`UPDATE users SET role = ? WHERE id = ?`).run(role, id);
+    res.json({ success: true });
+});
+app.delete('/api/admin/customers/:id', requireAdmin, (req, res) => {
+    const { id } = req.params;
+    const user = db_js_1.db.prepare(`SELECT email FROM users WHERE id = ?`).get(id);
+    if (!user)
+        return void res.status(404).json({ error: 'not found' });
+    // Hard delete the user
+    db_js_1.db.prepare(`DELETE FROM users WHERE id = ?`).run(id);
+    res.json({ success: true });
+});
 // ---- serve the built frontend (single-service production deploy) ------------
 // After `npm run build` in web/, the compiled SPA lives in web/dist. If present, this
 // server hosts both the API and the site on one origin — the simplest thing to deploy.
@@ -1344,5 +1514,8 @@ if (node_fs_1.default.existsSync(webDist)) {
     });
     console.log('Serving built frontend from web/dist');
 }
+app.get('/api/dev/users', (req, res) => {
+    res.json(db_js_1.db.prepare(`SELECT id, email, name, role FROM users`).all());
+});
 const PORT = Number(process.env.PORT ?? 4141);
 app.listen(PORT, () => console.log(`NAYO API listening on http://localhost:${PORT}`));

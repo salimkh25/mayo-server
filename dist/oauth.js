@@ -18,24 +18,16 @@ exports.verifyState = verifyState;
 exports.authUrl = authUrl;
 exports.exchangeCodeForProfile = exchangeCodeForProfile;
 const node_crypto_1 = __importDefault(require("node:crypto"));
-exports.PROVIDERS = ['google', 'facebook', 'apple'];
+exports.PROVIDERS = ['google', 'facebook'];
 const SESSION_SECRET = process.env.SESSION_SECRET ?? 'dev-session-secret-change-me';
 const env = {
     google: { id: process.env.GOOGLE_CLIENT_ID ?? '', secret: process.env.GOOGLE_CLIENT_SECRET ?? '' },
     facebook: { id: process.env.FACEBOOK_CLIENT_ID ?? '', secret: process.env.FACEBOOK_CLIENT_SECRET ?? '' },
-    apple: {
-        id: process.env.APPLE_CLIENT_ID ?? '', // Services ID, e.g. il.co.nayo.web
-        team: process.env.APPLE_TEAM_ID ?? '',
-        keyId: process.env.APPLE_KEY_ID ?? '',
-        privateKey: (process.env.APPLE_PRIVATE_KEY ?? '').replace(/\\n/g, '\n'),
-    },
 };
 function providerConfigured(p) {
     if (p === 'google')
         return Boolean(env.google.id && env.google.secret);
-    if (p === 'facebook')
-        return Boolean(env.facebook.id && env.facebook.secret);
-    return Boolean(env.apple.id && env.apple.team && env.apple.keyId && env.apple.privateKey);
+    return Boolean(env.facebook.id && env.facebook.secret);
 }
 const b64url = (b) => Buffer.from(b).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 // ---- signed state ----------------------------------------------------------
@@ -87,40 +79,9 @@ function authUrl(p, state, redirectUri) {
         });
         return `https://www.facebook.com/v19.0/dialog/oauth?${q}`;
     }
-    // apple — request name+email, which forces response_mode=form_post (a POST callback)
-    const q = new URLSearchParams({
-        client_id: env.apple.id,
-        redirect_uri: redirectUri,
-        response_type: 'code',
-        scope: 'name email',
-        response_mode: 'form_post',
-        state,
-    });
-    return `https://appleid.apple.com/auth/authorize?${q}`;
+    return '';
 }
-function decodeJwtPayload(jwt) {
-    const seg = jwt.split('.')[1];
-    return JSON.parse(Buffer.from(seg, 'base64').toString());
-}
-function appleClientSecret() {
-    const header = b64url(JSON.stringify({ alg: 'ES256', kid: env.apple.keyId, typ: 'JWT' }));
-    const now = Math.floor(Date.now() / 1000);
-    const payload = b64url(JSON.stringify({
-        iss: env.apple.team,
-        iat: now,
-        exp: now + 60 * 30,
-        aud: 'https://appleid.apple.com',
-        sub: env.apple.id,
-    }));
-    const signingInput = `${header}.${payload}`;
-    const signature = node_crypto_1.default
-        .createSign('SHA256')
-        .update(signingInput)
-        .sign({ key: env.apple.privateKey, dsaEncoding: 'ieee-p1363' });
-    return `${signingInput}.${b64url(signature)}`;
-}
-async function exchangeCodeForProfile(p, code, redirectUri, applePostedUser // Apple sends the display name only on first consent, as a POST field
-) {
+async function exchangeCodeForProfile(p, code, redirectUri) {
     if (p === 'google') {
         const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
             method: 'POST',
@@ -162,33 +123,5 @@ async function exchangeCodeForProfile(p, code, redirectUri, applePostedUser // A
             throw new Error('Facebook account has no shared email');
         return { email: String(u.email).toLowerCase(), name: u.name ?? '' };
     }
-    // apple
-    const tokenRes = await fetch('https://appleid.apple.com/auth/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-            code,
-            client_id: env.apple.id,
-            client_secret: appleClientSecret(),
-            redirect_uri: redirectUri,
-            grant_type: 'authorization_code',
-        }),
-    });
-    const tok = await tokenRes.json();
-    if (!tok.id_token)
-        throw new Error('Apple token exchange failed');
-    const claims = decodeJwtPayload(tok.id_token);
-    if (!claims.email)
-        throw new Error('Apple did not return an email');
-    let name = '';
-    if (applePostedUser) {
-        try {
-            const parsed = JSON.parse(applePostedUser);
-            name = [parsed?.name?.firstName, parsed?.name?.lastName].filter(Boolean).join(' ');
-        }
-        catch {
-            /* ignore */
-        }
-    }
-    return { email: String(claims.email).toLowerCase(), name };
+    throw new Error('Unsupported provider');
 }

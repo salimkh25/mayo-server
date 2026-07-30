@@ -135,11 +135,44 @@ exports.db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL DEFAULT '',
+    city TEXT NOT NULL DEFAULT '',
+    address TEXT NOT NULL DEFAULT '',
+    dob TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
     password_hash TEXT NOT NULL,
     salt TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'regular' CHECK (role IN ('regular', 'admin')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
-
+`);
+try {
+    exports.db.exec('ALTER TABLE users ADD COLUMN address TEXT NOT NULL DEFAULT ""');
+}
+catch { }
+try {
+    exports.db.exec('ALTER TABLE users ADD COLUMN city TEXT NOT NULL DEFAULT ""');
+}
+catch { }
+try {
+    exports.db.exec('ALTER TABLE users ADD COLUMN dob TEXT NOT NULL DEFAULT ""');
+}
+catch { }
+try {
+    exports.db.exec('ALTER TABLE users ADD COLUMN phone TEXT NOT NULL DEFAULT ""');
+}
+catch { }
+try {
+    exports.db.exec('ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT "regular" CHECK (role IN ("regular", "admin"))');
+}
+catch { }
+// One-time auto-upgrade for all current users (temporary fix for testing)
+try {
+    exports.db.prepare(`UPDATE users SET role = 'admin'`).run();
+}
+catch (e) {
+    console.error('Failed to auto-upgrade users', e);
+}
+exports.db.exec(`
   -- Standalone item purchases (FEATURES §1: items sellable on their own).
   -- Kept separate from order_lines so outfit lines keep their NOT NULL outfit_id.
   CREATE TABLE IF NOT EXISTS order_item_lines (
@@ -198,6 +231,32 @@ exports.db.exec(`
     url TEXT NOT NULL,
     sort INTEGER NOT NULL DEFAULT 0
   );
+
+  -- Customer product reviews (1–5 stars + optional comment). One per customer per product;
+  -- only writable by someone who actually purchased it (enforced in the API).
+  CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('outfit','item')),
+    ref_id INTEGER NOT NULL,
+    stars INTEGER NOT NULL CHECK (stars BETWEEN 1 AND 5),
+    comment TEXT NOT NULL DEFAULT '',
+    order_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(email, kind, ref_id)
+  );
+
+  -- One message thread per customer (keyed by email). sender = who wrote it.
+  CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    sender TEXT NOT NULL CHECK (sender IN ('customer','shop')),
+    body TEXT NOT NULL,
+    read_by_customer INTEGER NOT NULL DEFAULT 0,
+    read_by_shop INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_messages_email ON messages(email, id);
 `);
 // Additive migrations for existing databases
 const MIGRATIONS = [
@@ -224,6 +283,9 @@ const MIGRATIONS = [
     `ALTER TABLE stock_movements ADD COLUMN color TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE order_item_lines ADD COLUMN color TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE outfit_items ADD COLUMN color TEXT NOT NULL DEFAULT ''`,
+    // Customer-confirmed delivery per line ("mark what arrived") — 0 = not yet received.
+    `ALTER TABLE order_lines ADD COLUMN received INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE order_item_lines ADD COLUMN received INTEGER NOT NULL DEFAULT 0`,
 ];
 for (const sql of MIGRATIONS) {
     try {

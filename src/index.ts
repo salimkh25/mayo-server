@@ -425,6 +425,142 @@ app.get('/api/me', (req, res) => {
   res.json({ ...user, loyalty: tierFor(email) });
 });
 
+// ---- customer: order history, delivery confirmation, product reviews -------------
+
+/** A signed-in shopper's own orders, each with its lines, per-line "received" flag,
+ *  a thumbnail, and their own star review of that product (if any). */
+app.get('/api/my/orders', (req, res) => {
+  const email = emailFromToken(req);
+  if (!email) return void res.status(401).json({ error: 'unauthorized' });
+  const orders = db.prepare(
+    `SELECT id, status, subtotal_cents, discount_cents, shipping_cents, total_cents, ship_method, created_at
+     FROM orders WHERE email = ? ORDER BY id DESC`
+  ).all(email) as any[];
+
+  const reviewOf = (kind: string, refId: number) =>
+    (db.prepare(`SELECT stars, comment FROM reviews WHERE email = ? AND kind = ? AND ref_id = ?`).get(email, kind, refId) as any) ?? null;
+
+  res.json(orders.map((o) => {
+    const outfitLines = db.prepare(
+      `SELECT ol.id, ol.outfit_id AS refId, ol.size, ol.qty, ol.unit_price_cents, ol.received, ou.name, ou.slug
+       FROM order_lines ol JOIN outfits ou ON ou.id = ol.outfit_id WHERE ol.order_id = ?`
+    ).all(o.id) as any[];
+    const itemLines = db.prepare(
+      `SELECT il.id, il.item_id AS refId, il.size, il.color, il.qty, il.unit_price_cents, il.received, i.name, i.sku
+       FROM order_item_lines il JOIN items i ON i.id = il.item_id WHERE il.order_id = ?`
+    ).all(o.id) as any[];
+
+    const lines = [
+      ...outfitLines.map((l) => ({
+        kind: 'outfit', lineId: l.id, refId: l.refId, slug: l.slug, name: l.name,
+        size: l.size, color: '', qty: l.qty, unitPriceCents: l.unit_price_cents,
+        received: !!l.received, image: outfitPhotos(l.refId)[0] ?? '', review: reviewOf('outfit', l.refId),
+      })),
+      ...itemLines.map((l) => ({
+        kind: 'item', lineId: l.id, refId: l.refId, slug: l.sku, name: l.name,
+        size: l.size, color: l.color ?? '', qty: l.qty, unitPriceCents: l.unit_price_cents,
+        received: !!l.received, image: itemImages(l.refId)[0]?.url ?? '', review: reviewOf('item', l.refId),
+      })),
+    ];
+    return {
+      id: o.id, status: o.status, createdAt: o.created_at,
+      subtotalCents: o.subtotal_cents, discountCents: o.discount_cents,
+      shippingCents: o.shipping_cents, totalCents: o.total_cents, shipMethod: o.ship_method,
+      lines,
+    };
+  }));
+});
+
+/** Customer confirms (or un-confirms) that a specific line arrived. */
+app.post('/api/my/orders/received', (req, res) => {
+  const email = emailFromToken(req);
+  if (!email) return void res.status(401).json({ error: 'unauthorized' });
+  const { kind, lineId, received } = req.body ?? {};
+  const table = kind === 'item' ? 'order_item_lines' : kind === 'outfit' ? 'order_lines' : null;
+  if (!table || !Number.isInteger(lineId)) return void res.status(400).json({ error: 'valid kind and lineId required' });
+  const owns = db.prepare(`SELECT 1 FROM ${table} l JOIN orders o ON o.id = l.order_id WHERE l.id = ? AND o.email = ?`).get(lineId, email);
+  if (!owns) return void res.status(404).json({ error: 'line not found' });
+  db.prepare(`UPDATE ${table} SET received = ? WHERE id = ?`).run(received ? 1 : 0, lineId);
+  res.json({ ok: true });
+});
+
+/** Create or update the shopper's star review for a product they purchased. */
+app.post('/api/my/review', (req, res) => {
+  const email = emailFromToken(req);
+  if (!email) return void res.status(401).json({ error: 'unauthorized' });
+  const { kind, refId, stars, comment } = req.body ?? {};
+  if ((kind !== 'outfit' && kind !== 'item') || !Number.isInteger(refId) || !Number.isInteger(stars) || stars < 1 || stars > 5)
+    return void res.status(400).json({ error: 'kind, refId and stars (1–5) required' });
+  const bought = kind === 'outfit'
+    ? db.prepare(`SELECT 1 FROM order_lines l JOIN orders o ON o.id = l.order_id WHERE o.email = ? AND l.outfit_id = ? AND o.status != 'cancelled'`).get(email, refId)
+    : db.prepare(`SELECT 1 FROM order_item_lines l JOIN orders o ON o.id = l.order_id WHERE o.email = ? AND l.item_id = ? AND o.status != 'cancelled'`).get(email, refId);
+  if (!bought) return void res.status(403).json({ error: 'You can only review products you have purchased.' });
+
+  db.prepare(
+    `INSERT INTO reviews (email, kind, ref_id, stars, comment) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(email, kind, ref_id) DO UPDATE SET stars = excluded.stars, comment = excluded.comment, created_at = datetime('now')`
+  ).run(email, kind, refId, stars, String(comment ?? ''));
+
+  // Keep the outfit's public aggregate rating in sync (items have no aggregate column yet).
+  if (kind === 'outfit') {
+    const avg = (db.prepare(`SELECT AVG(stars) AS a FROM reviews WHERE kind = 'outfit' AND ref_id = ?`).get(refId) as any).a ?? 0;
+    db.prepare(`UPDATE outfits SET rating = ? WHERE id = ?`).run(Math.round(avg * 10) / 10, refId);
+  }
+  res.json({ ok: true });
+});
+
+// ---- customer ⇄ shop messaging --------------------------------------------------
+
+/** The signed-in shopper's message thread with the shop. Reading it marks the shop's
+ *  replies as seen. */
+app.get('/api/my/messages', (req, res) => {
+  const email = emailFromToken(req);
+  if (!email) return void res.status(401).json({ error: 'unauthorized' });
+  const messages = db.prepare(
+    `SELECT id, sender, body, created_at AS createdAt FROM messages WHERE email = ? ORDER BY id`
+  ).all(email);
+  db.prepare(`UPDATE messages SET read_by_customer = 1 WHERE email = ? AND sender = 'shop'`).run(email);
+  res.json(messages);
+});
+
+app.post('/api/my/messages', (req, res) => {
+  const email = emailFromToken(req);
+  if (!email) return void res.status(401).json({ error: 'unauthorized' });
+  const body = String(req.body?.body ?? '').trim();
+  if (!body) return void res.status(400).json({ error: 'Message can’t be empty.' });
+  db.prepare(`INSERT INTO messages (email, sender, body, read_by_customer) VALUES (?, 'customer', ?, 1)`).run(email, body.slice(0, 4000));
+  notify(`💬 New message from ${email}`, { title: 'NAYO — Customer message', url: `${publicUrl(req)}/admin/messages` });
+  res.json({ ok: true });
+});
+
+/** Admin: one row per customer thread with a preview and unread (from-customer) count. */
+app.get('/api/admin/messages', requireAdmin, (_req, res) => {
+  const threads = db.prepare(
+    `SELECT m.email,
+            (SELECT body FROM messages WHERE email = m.email ORDER BY id DESC LIMIT 1) AS lastBody,
+            (SELECT created_at FROM messages WHERE email = m.email ORDER BY id DESC LIMIT 1) AS lastAt,
+            SUM(CASE WHEN sender = 'customer' AND read_by_shop = 0 THEN 1 ELSE 0 END) AS unread,
+            (SELECT name FROM users WHERE users.email = m.email) AS name
+     FROM messages m GROUP BY m.email ORDER BY lastAt DESC`
+  ).all();
+  res.json(threads);
+});
+
+app.get('/api/admin/messages/:email', requireAdmin, (req, res) => {
+  const email = String(req.params.email).toLowerCase();
+  const messages = db.prepare(`SELECT id, sender, body, created_at AS createdAt FROM messages WHERE email = ? ORDER BY id`).all(email);
+  db.prepare(`UPDATE messages SET read_by_shop = 1 WHERE email = ? AND sender = 'customer'`).run(email);
+  res.json({ email, name: (db.prepare(`SELECT name FROM users WHERE email = ?`).get(email) as any)?.name ?? '', messages });
+});
+
+app.post('/api/admin/messages/:email', requireAdmin, (req, res) => {
+  const email = String(req.params.email).toLowerCase();
+  const body = String(req.body?.body ?? '').trim();
+  if (!body) return void res.status(400).json({ error: 'Message can’t be empty.' });
+  db.prepare(`INSERT INTO messages (email, sender, body, read_by_shop) VALUES (?, 'shop', ?, 1)`).run(email, body.slice(0, 4000));
+  res.json({ ok: true });
+});
+
 // ---- public: personalized recommendations (consented, first-party data only) ----
 
 app.get('/api/recommendations', (req, res) => {

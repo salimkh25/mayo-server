@@ -144,22 +144,5 @@ function seedIfEmpty() {
         for (const t of themeSlugs)
             insOT.run(oid, themes[t]);
     }
-    // a few historical orders so the dashboard has numbers
-    const insOrder = db_js_1.db.prepare(`INSERT INTO orders (email, customer_name, status, subtotal_cents, discount_cents, total_cents, tier_at_purchase, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', ?))`);
-    const insLine = db_js_1.db.prepare(`INSERT INTO order_lines (order_id, outfit_id, size, qty, unit_price_cents) VALUES (?, ?, ?, ?, ?)`);
-    const demoOrders = [
-        ['noa.levi@example.com', 'Noa Levi', 6400, 'sage-garden-set', 1, '-12 days'],
-        ['maya.cohen@example.com', 'Maya Cohen', 7800, 'pool-party-splash', 1, '-9 days'],
-        ['dana.mizrahi@example.com', 'Dana Mizrahi', 14400, 'first-day-hero', 2, '-6 days'],
-        ['noa.levi@example.com', 'Noa Levi', 7500, 'petit-scholar', 1, '-3 days'],
-        ['shira.katz@example.com', 'Shira Katz', 6900, 'harbor-days', 1, '-1 days'],
-    ];
-    for (const [email, cname, total, slug, qty, ago] of demoOrders) {
-        insOrder.run(email, cname, 'delivered', total, 0, total, 'Insider', ago);
-        const orderId = Number(db_js_1.db.prepare(`SELECT last_insert_rowid() AS id`).get().id);
-        const o = db_js_1.db.prepare(`SELECT id, price_cents FROM outfits WHERE slug = ?`).get(slug);
-        insLine.run(orderId, o.id, '5-6Y', qty, o.price_cents);
-    }
     console.log('Seed complete.');
 }
