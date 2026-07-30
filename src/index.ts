@@ -1418,14 +1418,22 @@ app.post('/api/admin/upload', requireAdmin, async (req, res) => {
 app.get('/api/admin/customers', requireAdmin, (_req, res) => {
   const rows = db
     .prepare(
-      `SELECT email,
-              MAX(customer_name) AS name,
-              COUNT(*) AS orders,
-              SUM(total_cents) AS spend_cents,
-              MIN(created_at) AS first_order,
-              MAX(created_at) AS last_order
-       FROM orders WHERE status != 'cancelled'
-       GROUP BY email
+      `SELECT COALESCE(u.email, o.email) AS email,
+              u.id AS user_id,
+              COALESCE(u.name, MAX(o.customer_name)) AS name,
+              u.role,
+              u.city,
+              u.phone,
+              COUNT(o.id) AS orders,
+              COALESCE(SUM(o.total_cents), 0) AS spend_cents,
+              MIN(o.created_at) AS first_order,
+              MAX(o.created_at) AS last_order
+       FROM (SELECT DISTINCT email FROM (
+         SELECT email FROM users UNION SELECT email FROM orders WHERE status != 'cancelled'
+       )) e
+       LEFT JOIN users u ON u.email = e.email
+       LEFT JOIN orders o ON o.email = e.email AND o.status != 'cancelled'
+       GROUP BY e.email
        ORDER BY spend_cents DESC`
     )
     .all() as any[];
@@ -1434,14 +1442,18 @@ app.get('/api/admin/customers', requireAdmin, (_req, res) => {
     const tier = tierFor(r.email);
     return {
       email: r.email,
+      userId: r.user_id,
       name: r.name || r.email.split('@')[0],
+      role: r.role || 'guest',
+      city: r.city || '',
+      phone: r.phone || '',
       orders: r.orders,
       spendCents: r.spend_cents,
       aovCents: r.orders ? Math.round(r.spend_cents / r.orders) : 0,
       firstOrder: r.first_order,
       lastOrder: r.last_order,
       tier: tier.tier.name,
-      hasAccount: !!db.prepare(`SELECT 1 FROM users WHERE email = ?`).get(r.email),
+      hasAccount: !!r.user_id,
     };
   });
 
@@ -1476,6 +1488,23 @@ app.get('/api/admin/customers', requireAdmin, (_req, res) => {
     },
     customers,
   });
+});
+
+app.patch('/api/admin/customers/:id/role', requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const { role } = req.body ?? {};
+  if (!['admin', 'regular'].includes(role)) return void res.status(400).json({ error: 'invalid role' });
+  db.prepare(`UPDATE users SET role = ? WHERE id = ?`).run(role, id);
+  res.json({ success: true });
+});
+
+app.delete('/api/admin/customers/:id', requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const user = db.prepare(`SELECT email FROM users WHERE id = ?`).get(id) as any;
+  if (!user) return void res.status(404).json({ error: 'not found' });
+  // Hard delete the user
+  db.prepare(`DELETE FROM users WHERE id = ?`).run(id);
+  res.json({ success: true });
 });
 
 // ---- serve the built frontend (single-service production deploy) ------------
