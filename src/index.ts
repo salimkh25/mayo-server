@@ -39,6 +39,9 @@ app.use((req, res, next) => {
 const PUBLIC_URL = (process.env.PUBLIC_URL ?? '').replace(/\/$/, '');
 const publicUrl = (req: express.Request) =>
   PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
+
+const CLIENT_URL = (process.env.CLIENT_URL ?? '').replace(/\/$/, '') || 'http://localhost:5173';
+
 // Served under /api so the Vite dev proxy forwards it; also works in prod behind one host.
 app.use('/api/uploads', express.static(uploadsDir, { maxAge: '365d', immutable: true }));
 
@@ -844,8 +847,8 @@ app.get('/api/auth/:provider/start', (req, res) => {
   const p = req.params.provider as oauth.Provider;
   if (!oauth.PROVIDERS.includes(p)) return void res.status(404).json({ error: 'unknown provider' });
   if (!oauth.providerConfigured(p))
-    return void res.redirect('/login?error=' + encodeURIComponent(`${p} sign-in is not set up yet`));
-  const redirectUri = `${publicUrl(req)}/api/auth/${p}/callback`;
+    return void res.redirect(`${CLIENT_URL}/login?error=` + encodeURIComponent(`${p} sign-in is not set up yet`));
+  const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/${p}/callback`;
   res.redirect(oauth.authUrl(p, oauth.makeState(), redirectUri));
 });
 
@@ -859,10 +862,10 @@ async function handleOAuthCallback(
     const profile = await oauth.exchangeCodeForProfile(p, code, redirectUri);
     const token = upsertOAuthUser(profile.email, profile.name);
     const frag = new URLSearchParams({ token, email: profile.email, name: profile.name || '' }).toString();
-    res.redirect(`/auth/callback#${frag}`);
+    res.redirect(`${CLIENT_URL}/auth/callback#${frag}`);
   } catch (e: any) {
     console.error('oauth callback error', e?.message ?? e);
-    res.redirect('/login?error=' + encodeURIComponent('Sign-in failed — please try again'));
+    res.redirect(`${CLIENT_URL}/login?error=` + encodeURIComponent('Sign-in failed — please try again'));
   }
 }
 
