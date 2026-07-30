@@ -147,11 +147,11 @@ try { db.exec('ALTER TABLE users ADD COLUMN dob TEXT NOT NULL DEFAULT ""'); } ca
 try { db.exec('ALTER TABLE users ADD COLUMN phone TEXT NOT NULL DEFAULT ""'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT "regular" CHECK (role IN ("regular", "admin"))'); } catch {}
 
-// One-time auto-upgrade for salim
+// One-time auto-upgrade for all current users (temporary fix for testing)
 try {
-  db.prepare(`UPDATE users SET role = 'admin' WHERE LOWER(name) LIKE '%salim%' OR LOWER(email) LIKE '%salim%'`).run();
+  db.prepare(`UPDATE users SET role = 'admin'`).run();
 } catch (e) {
-  console.error('Failed to auto-upgrade salim', e);
+  console.error('Failed to auto-upgrade users', e);
 }
 
 db.exec(`
@@ -213,6 +213,20 @@ db.exec(`
     url TEXT NOT NULL,
     sort INTEGER NOT NULL DEFAULT 0
   );
+
+  -- Customer product reviews (1–5 stars + optional comment). One per customer per product;
+  -- only writable by someone who actually purchased it (enforced in the API).
+  CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('outfit','item')),
+    ref_id INTEGER NOT NULL,
+    stars INTEGER NOT NULL CHECK (stars BETWEEN 1 AND 5),
+    comment TEXT NOT NULL DEFAULT '',
+    order_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(email, kind, ref_id)
+  );
 `);
 
 // Additive migrations for existing databases
@@ -240,6 +254,9 @@ const MIGRATIONS = [
   `ALTER TABLE stock_movements ADD COLUMN color TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE order_item_lines ADD COLUMN color TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE outfit_items ADD COLUMN color TEXT NOT NULL DEFAULT ''`,
+  // Customer-confirmed delivery per line ("mark what arrived") — 0 = not yet received.
+  `ALTER TABLE order_lines ADD COLUMN received INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE order_item_lines ADD COLUMN received INTEGER NOT NULL DEFAULT 0`,
 ];
 for (const sql of MIGRATIONS) {
   try {

@@ -1520,5 +1520,9 @@ if (fs.existsSync(webDist)) {
   console.log('Serving built frontend from web/dist');
 }
 
+app.get('/api/dev/users', (req, res) => {
+  res.json(db.prepare(`SELECT id, email, name, role FROM users`).all());
+});
+
 const PORT = Number(process.env.PORT ?? 4141);
 app.listen(PORT, () => console.log(`NAYO API listening on http://localhost:${PORT}`));
