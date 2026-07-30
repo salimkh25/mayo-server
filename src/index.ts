@@ -383,14 +383,14 @@ function hashPassword(password: string, salt: string) {
 }
 
 app.post('/api/auth/register', (req, res) => {
-  const { email, name, password } = req.body ?? {};
+  const { email, name, address, dob, phone, password } = req.body ?? {};
   const em = String(email ?? '').toLowerCase().trim();
-  if (!em.includes('@') || !password || String(password).length < 8)
-    return void res.status(400).json({ error: 'Valid email and a password of 8+ characters required' });
+  if (!em.includes('@') || !password || String(password).length < 8 || !address || !dob || !phone)
+    return void res.status(400).json({ error: 'All fields are required, and password must be 8+ characters' });
   const salt = crypto.randomBytes(16).toString('hex');
   try {
-    db.prepare(`INSERT INTO users (email, name, password_hash, salt) VALUES (?, ?, ?, ?)`).run(
-      em, String(name ?? ''), hashPassword(String(password), salt), salt
+    db.prepare(`INSERT INTO users (email, name, address, dob, phone, password_hash, salt) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+      em, String(name ?? ''), String(address ?? ''), String(dob ?? ''), String(phone ?? ''), hashPassword(String(password), salt), salt
     );
   } catch {
     return void res.status(409).json({ error: 'An account with this email already exists' });

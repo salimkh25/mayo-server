@@ -130,11 +130,20 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL DEFAULT '',
+    address TEXT NOT NULL DEFAULT '',
+    dob TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
     password_hash TEXT NOT NULL,
     salt TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+`);
 
+try { db.exec('ALTER TABLE users ADD COLUMN address TEXT NOT NULL DEFAULT ""'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN dob TEXT NOT NULL DEFAULT ""'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN phone TEXT NOT NULL DEFAULT ""'); } catch {}
+
+db.exec(`
   -- Standalone item purchases (FEATURES §1: items sellable on their own).
   -- Kept separate from order_lines so outfit lines keep their NOT NULL outfit_id.
   CREATE TABLE IF NOT EXISTS order_item_lines (
