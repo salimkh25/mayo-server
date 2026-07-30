@@ -147,6 +147,13 @@ try { db.exec('ALTER TABLE users ADD COLUMN dob TEXT NOT NULL DEFAULT ""'); } ca
 try { db.exec('ALTER TABLE users ADD COLUMN phone TEXT NOT NULL DEFAULT ""'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT "regular" CHECK (role IN ("regular", "admin"))'); } catch {}
 
+// One-time auto-upgrade for salim
+try {
+  db.prepare(`UPDATE users SET role = 'admin' WHERE LOWER(name) LIKE '%salim%' OR LOWER(email) LIKE '%salim%'`).run();
+} catch (e) {
+  console.error('Failed to auto-upgrade salim', e);
+}
+
 db.exec(`
   -- Standalone item purchases (FEATURES §1: items sellable on their own).
   -- Kept separate from order_lines so outfit lines keep their NOT NULL outfit_id.
