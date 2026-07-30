@@ -54,8 +54,11 @@ const ADMIN_KEY = process.env.ADMIN_KEY ?? 'admin-dev-key';
 const SCARCITY_THRESHOLD = Number(process.env.SCARCITY_THRESHOLD ?? 5);
 
 function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
-  if (emailFromToken(req) === '__admin__') return next();
-  res.status(401).json({ error: 'unauthorized' });
+  const email = emailFromToken(req);
+  if (!email) return void res.status(401).json({ error: 'unauthorized' });
+  const user = db.prepare(`SELECT role FROM users WHERE email = ?`).get(email) as any;
+  if (user?.role === 'admin') return next();
+  res.status(403).json({ error: 'forbidden - admins only' });
 }
 
 // ---- helpers -------------------------------------------------------------
@@ -386,19 +389,19 @@ function hashPassword(password: string, salt: string) {
 }
 
 app.post('/api/auth/register', (req, res) => {
-  const { email, name, address, dob, phone, password } = req.body ?? {};
+  const { email, name, city, address, dob, phone, password } = req.body ?? {};
   const em = String(email ?? '').toLowerCase().trim();
-  if (!em.includes('@') || !password || String(password).length < 8 || !address || !dob || !phone)
+  if (!em.includes('@') || !password || String(password).length < 8 || !city || !address || !dob || !phone)
     return void res.status(400).json({ error: 'All fields are required, and password must be 8+ characters' });
   const salt = crypto.randomBytes(16).toString('hex');
   try {
-    db.prepare(`INSERT INTO users (email, name, address, dob, phone, password_hash, salt) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
-      em, String(name ?? ''), String(address ?? ''), String(dob ?? ''), String(phone ?? ''), hashPassword(String(password), salt), salt
+    db.prepare(`INSERT INTO users (email, name, city, address, dob, phone, password_hash, salt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      em, String(name ?? ''), String(city ?? ''), String(address ?? ''), String(dob ?? ''), String(phone ?? ''), hashPassword(String(password), salt), salt
     );
   } catch {
     return void res.status(409).json({ error: 'An account with this email already exists' });
   }
-  res.json({ token: makeToken(em), email: em, name: String(name ?? '') });
+  res.json({ token: makeToken(em), email: em, name: String(name ?? ''), role: 'regular' });
 });
 
 app.post('/api/auth/login', (req, res) => {
@@ -411,7 +414,7 @@ app.post('/api/auth/login', (req, res) => {
   const b = Buffer.from(user.password_hash);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b))
     return void res.status(401).json({ error: 'Invalid email or password' });
-  res.json({ token: makeToken(em), email: em, name: user.name });
+  res.json({ token: makeToken(em), email: em, name: user.name, role: user.role });
 });
 
 app.get('/api/me', (req, res) => {
@@ -987,7 +990,10 @@ app.get('/api/admin/items', requireAdmin, (_req, res) => {
 app.post('/api/admin/login', (req, res) => {
   const { password } = req.body ?? {};
   if (password === ADMIN_KEY) {
-    res.json({ token: makeToken('__admin__') });
+    const email = emailFromToken(req);
+    if (!email) return void res.status(401).json({ error: 'You must be logged in as a regular user first to upgrade to admin.' });
+    db.prepare(`UPDATE users SET role = 'admin' WHERE email = ?`).run(email);
+    res.json({ success: true, role: 'admin' });
   } else {
     res.status(401).json({ error: 'Invalid admin password' });
   }
