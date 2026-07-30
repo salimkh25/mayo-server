@@ -823,7 +823,7 @@ app.get('/api/orders/by-session/:sid', async (req, res) => {
   res.json(order);
 });
 
-// ---- social sign-in (Google / Facebook / Apple) ----------------------------
+// ---- social sign-in (Google / Facebook) ----------------------------
 
 function upsertOAuthUser(email: string, name: string): string {
   const em = email.toLowerCase().trim();
@@ -851,14 +851,12 @@ app.get('/api/auth/:provider/start', (req, res) => {
 
 async function handleOAuthCallback(
   p: oauth.Provider, req: express.Request, res: express.Response,
-  code: string, state: string | undefined, appleUser: string | undefined
+  code: string, state: string | undefined
 ) {
-  if (!oauth.PROVIDERS.includes(p)) return void res.status(404).send('unknown provider');
-  if (!oauth.verifyState(state) || !code)
-    return void res.redirect('/login?error=' + encodeURIComponent('Sign-in expired — please try again'));
   try {
-    const redirectUri = `${publicUrl(req)}/api/auth/${p}/callback`;
-    const profile = await oauth.exchangeCodeForProfile(p, code, redirectUri, appleUser);
+    if (!oauth.verifyState(state)) throw new Error('Invalid state (CSRF match failed)');
+    const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/${p}/callback`;
+    const profile = await oauth.exchangeCodeForProfile(p, code, redirectUri);
     const token = upsertOAuthUser(profile.email, profile.name);
     const frag = new URLSearchParams({ token, email: profile.email, name: profile.name || '' }).toString();
     res.redirect(`/auth/callback#${frag}`);
@@ -869,14 +867,7 @@ async function handleOAuthCallback(
 }
 
 app.get('/api/auth/:provider/callback', (req, res) => {
-  void handleOAuthCallback(
-    req.params.provider as oauth.Provider, req, res,
-    String(req.query.code ?? ''), req.query.state as string | undefined, undefined
-  );
-});
-// Apple uses response_mode=form_post, so its callback arrives as a POST form body.
-app.post('/api/auth/apple/callback', express.urlencoded({ extended: true }), (req, res) => {
-  void handleOAuthCallback('apple', req, res, String(req.body.code ?? ''), req.body.state, req.body.user);
+  void handleOAuthCallback(req.params.provider as oauth.Provider, req, res, String(req.query.code ?? ''), String(req.query.state ?? ''));
 });
 
 // ---- public: consent-gated events -------------------------------------------
